@@ -76,12 +76,14 @@ jobs:
             changelog_range="$RELEASE_TAG"
           fi
 
-          git log --reverse --pretty=format:'- %s (%h)' "$changelog_range" |
+          git log --reverse --max-count=200 --pretty=format:'- %s (%h)' "$changelog_range" |
             grep -Ev '^- (docs:|test:)' > "$changelog_entries_file" || true
 
-          gh api "repos/${GH_REPO}/releases/generate-notes" \
+          if ! gh api "repos/${GH_REPO}/releases/generate-notes" \
             -f tag_name="$RELEASE_TAG" \
-            --jq .body > "$generated_notes_file"
+            --jq .body > "$generated_notes_file"; then
+            : > "$generated_notes_file"
+          fi
           if [[ ! -s "$generated_notes_file" ]]; then
             if [[ -n "$previous_tag" ]]; then
               printf '**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "$GH_REPO" "$previous_tag" "$RELEASE_TAG" > "$generated_notes_file"
