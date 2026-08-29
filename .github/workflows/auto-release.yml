@@ -1,0 +1,121 @@
+name: auto-release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional release version, with or without the v prefix (for example 0.1.0)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-release-main
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: '1.26.4'
+
+jobs:
+  prepare:
+    name: test, compile, and tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release-tag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Refresh models catalog
+        run: bash .github/scripts/refresh-model-catalogs.sh
+
+      - name: Determine release tag
+        id: release-tag
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          requested="${REQUESTED_VERSION:-}"
+          if [[ -n "$requested" ]]; then
+            requested="${requested#v}"
+            release_tag="v${requested}"
+          else
+            latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n 1 || true)"
+            if [[ "$latest_tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              next_patch=$((BASH_REMATCH[3] + 1))
+              release_tag="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${next_patch}"
+            else
+              release_tag="v0.1.0"
+            fi
+          fi
+
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release version must use the form vMAJOR.MINOR.PATCH: $release_tag"
+            exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/$release_tag"; then
+            echo "::error::release tag already exists: $release_tag"
+            exit 1
+          fi
+
+          release_version="${release_tag#v}"
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "Preparing $release_tag"
+
+      - name: Test and compile Linux executable
+        env:
+          RELEASE_VERSION: ${{ steps.release-tag.outputs.version }}
+          COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./...
+          mkdir -p dist/preflight
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildvcs=false \
+            -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${build_date}" \
+            -o dist/preflight/cli-proxy-api ./cmd/server/
+          test -x dist/preflight/cli-proxy-api
+
+      - name: Upload preflight executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-proxy-api-linux-amd64-preflight
+          path: dist/preflight/cli-proxy-api
+          if-no-files-found: error
+
+      - name: Create and push annotated tag
+        env:
+          RELEASE_TAG: ${{ steps.release-tag.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag --annotate "$RELEASE_TAG" --message "Release $RELEASE_TAG" HEAD
+          git push origin "refs/tags/$RELEASE_TAG"
+
+  release:
+    name: publish ${{ needs.prepare.outputs.tag }}
+    needs: prepare
+    uses: ./.github/workflows/release.yaml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+    secrets: inherit

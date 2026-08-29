@@ -5,6 +5,18 @@ on:
     # run only against tags
     tags:
       - '*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish (for example v0.1.0)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to build and publish'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,6 +24,7 @@ permissions:
 env:
   GH_REPO: ${{ github.repository }}
   GO_VERSION: '1.26.4'
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   prepare-release:
@@ -21,6 +34,7 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+          ref: ${{ inputs.tag || github.ref }}
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -39,34 +53,40 @@ jobs:
 
           - `CLIProxyAPI_<version>_linux_<arch>.tar.gz` is the default Linux build. It supports dynamic library plugins and is built against a GLIBC 2.17 baseline.
           - `CLIProxyAPI_<version>_linux_<arch>_no-plugin.tar.gz` is the portable Linux build for musl-based or older systems such as OpenWrt. It does not support dynamic library plugins.
+          - Matching files without an archive suffix are standalone Linux executables.
 
           ## FreeBSD release assets
 
           - `CLIProxyAPI_<version>_freebsd_aarch64_no-plugin.tar.gz` is the FreeBSD arm64 build. It is built without CGO and does not support dynamic library plugins.
+          - Matching files without an archive suffix are standalone FreeBSD executables.
+
+          ## Hosted release assets
+
+          - Matching files without an archive suffix (and `.exe` on Windows) are standalone executables for macOS, Windows, and Linux.
 
           <!-- cliproxyapi-linux-release-assets:end -->
           EOF
 
           git fetch --force --tags
           previous_tag=""
-          if previous_tag_value="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null)"; then
+          if previous_tag_value="$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null)"; then
             previous_tag="$previous_tag_value"
-            changelog_range="${previous_tag}..${GITHUB_REF_NAME}"
+            changelog_range="${previous_tag}..${RELEASE_TAG}"
           else
-            changelog_range="$GITHUB_REF_NAME"
+            changelog_range="$RELEASE_TAG"
           fi
 
           git log --reverse --pretty=format:'- %s (%h)' "$changelog_range" |
             grep -Ev '^- (docs:|test:)' > "$changelog_entries_file" || true
 
           gh api "repos/${GH_REPO}/releases/generate-notes" \
-            -f tag_name="$GITHUB_REF_NAME" \
+            -f tag_name="$RELEASE_TAG" \
             --jq .body > "$generated_notes_file"
           if [[ ! -s "$generated_notes_file" ]]; then
             if [[ -n "$previous_tag" ]]; then
-              printf '**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "$GH_REPO" "$previous_tag" "$GITHUB_REF_NAME" > "$generated_notes_file"
+              printf '**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "$GH_REPO" "$previous_tag" "$RELEASE_TAG" > "$generated_notes_file"
             else
-              printf '**Full Changelog**: https://github.com/%s/commits/%s\n' "$GH_REPO" "$GITHUB_REF_NAME" > "$generated_notes_file"
+              printf '**Full Changelog**: https://github.com/%s/commits/%s\n' "$GH_REPO" "$RELEASE_TAG" > "$generated_notes_file"
             fi
           fi
 
@@ -85,10 +105,10 @@ jobs:
             cat "$changelog_notes_file"
           } > "$updated_notes_file"
 
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$updated_notes_file"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file "$updated_notes_file"
           else
-            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$updated_notes_file"
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file "$updated_notes_file"
           fi
 
   build-hosted:
@@ -127,6 +147,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -150,7 +171,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
           echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
       - name: Build archive
@@ -177,6 +198,13 @@ jobs:
             -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
             -o "$archive_dir/$binary_name" ./cmd/server/
 
+          binary_asset="dist/CLIProxyAPI_${RELEASE_VERSION}_${GOOS}_${ASSET_ARCH}"
+          if [[ "$GOOS" == "windows" ]]; then
+            binary_asset+=".exe"
+          fi
+          cp "$archive_dir/$binary_name" "$binary_asset"
+          echo "BINARY_ASSET=$binary_asset" >> "$GITHUB_ENV"
+
           cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/"
           if [[ "$ARCHIVE_FORMAT" == "zip" ]]; then
             powershell -NoProfile -Command "Compress-Archive -Path '${archive_dir}/*' -DestinationPath 'dist/${archive_name}' -Force"
@@ -195,13 +223,14 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          assets=(dist/CLIProxyAPI_*.tar.gz dist/CLIProxyAPI_*.zip)
+          assets=(dist/CLIProxyAPI_*.tar.gz dist/CLIProxyAPI_*.zip "$BINARY_ASSET")
           if [[ ${#assets[@]} -eq 0 ]]; then
-            printf 'expected archive assets, found %s\n' "${#assets[@]}" >&2
+            printf 'expected release assets, found %s\n' "${#assets[@]}" >&2
             printf '%s\n' "${assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          [[ -f "$BINARY_ASSET" ]] || { echo "missing binary asset: $BINARY_ASSET" >&2; exit 1; }
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
       - name: Refresh release checksums
         continue-on-error: true
         shell: bash
@@ -211,15 +240,14 @@ jobs:
           set -euo pipefail
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
-          gh release download "$GITHUB_REF_NAME" \
-            --pattern 'CLIProxyAPI_*.tar.gz' \
-            --pattern 'CLIProxyAPI_*.zip' \
+          gh release download "$RELEASE_TAG" \
+            --pattern 'CLIProxyAPI_*' \
             --dir "$tmp_dir" \
             --clobber
           (
             cd "$tmp_dir"
             shopt -s nullglob
-            archives=(CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip)
+            archives=(CLIProxyAPI_*)
             if [[ ${#archives[@]} -eq 0 ]]; then
               echo "No release archives found"
               exit 0
@@ -230,7 +258,7 @@ jobs:
               shasum -a 256 "${archives[@]}" | sort -k2 > checksums.txt
             fi
           )
-          gh release upload "$GITHUB_REF_NAME" "$tmp_dir/checksums.txt" --clobber
+          gh release upload "$RELEASE_TAG" "$tmp_dir/checksums.txt" --clobber
 
   build-linux-glibc:
     name: build linux-${{ matrix.goarch }} glibc
@@ -254,6 +282,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -268,7 +297,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
           echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
       - name: Build archive
@@ -317,6 +346,10 @@ jobs:
               fi
             '
 
+          binary_asset="dist/CLIProxyAPI_${RELEASE_VERSION}_linux_${ASSET_ARCH}"
+          cp "${archive_dir}/cli-proxy-api" "$binary_asset"
+          echo "BINARY_ASSET=$binary_asset" >> "$GITHUB_ENV"
+
           cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/"
           tar -C "$archive_dir" -czf "dist/$archive_name" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml
       - uses: actions/upload-artifact@v4
@@ -331,13 +364,14 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          assets=(dist/CLIProxyAPI_*.tar.gz)
+          assets=(dist/CLIProxyAPI_*.tar.gz "$BINARY_ASSET")
           if [[ ${#assets[@]} -eq 0 ]]; then
-            printf 'expected archive assets, found %s\n' "${#assets[@]}" >&2
+            printf 'expected release assets, found %s\n' "${#assets[@]}" >&2
             printf '%s\n' "${assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          [[ -f "$BINARY_ASSET" ]] || { echo "missing binary asset: $BINARY_ASSET" >&2; exit 1; }
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
       - name: Refresh release checksums
         continue-on-error: true
         shell: bash
@@ -347,15 +381,14 @@ jobs:
           set -euo pipefail
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
-          gh release download "$GITHUB_REF_NAME" \
-            --pattern 'CLIProxyAPI_*.tar.gz' \
-            --pattern 'CLIProxyAPI_*.zip' \
+          gh release download "$RELEASE_TAG" \
+            --pattern 'CLIProxyAPI_*' \
             --dir "$tmp_dir" \
             --clobber
           (
             cd "$tmp_dir"
             shopt -s nullglob
-            archives=(CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip)
+            archives=(CLIProxyAPI_*)
             if [[ ${#archives[@]} -eq 0 ]]; then
               echo "No release archives found"
               exit 0
@@ -366,7 +399,7 @@ jobs:
               shasum -a 256 "${archives[@]}" | sort -k2 > checksums.txt
             fi
           )
-          gh release upload "$GITHUB_REF_NAME" "$tmp_dir/checksums.txt" --clobber
+          gh release upload "$RELEASE_TAG" "$tmp_dir/checksums.txt" --clobber
 
   build-linux-no-plugin:
     name: build linux-${{ matrix.goarch }} no-plugin
@@ -386,6 +419,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -409,7 +443,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
           echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
       - name: Build archive
@@ -436,6 +470,10 @@ jobs:
             exit 1
           fi
 
+          binary_asset="dist/CLIProxyAPI_${RELEASE_VERSION}_linux_${ASSET_ARCH}_no-plugin"
+          cp "$archive_dir/cli-proxy-api" "$binary_asset"
+          echo "BINARY_ASSET=$binary_asset" >> "$GITHUB_ENV"
+
           cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/"
           tar -C "$archive_dir" -czf "dist/$archive_name" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml
       - uses: actions/upload-artifact@v4
@@ -450,13 +488,14 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          assets=(dist/CLIProxyAPI_*.tar.gz)
+          assets=(dist/CLIProxyAPI_*.tar.gz "$BINARY_ASSET")
           if [[ ${#assets[@]} -eq 0 ]]; then
-            printf 'expected archive assets, found %s\n' "${#assets[@]}" >&2
+            printf 'expected release assets, found %s\n' "${#assets[@]}" >&2
             printf '%s\n' "${assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          [[ -f "$BINARY_ASSET" ]] || { echo "missing binary asset: $BINARY_ASSET" >&2; exit 1; }
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
       - name: Refresh release checksums
         continue-on-error: true
         shell: bash
@@ -466,15 +505,14 @@ jobs:
           set -euo pipefail
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
-          gh release download "$GITHUB_REF_NAME" \
-            --pattern 'CLIProxyAPI_*.tar.gz' \
-            --pattern 'CLIProxyAPI_*.zip' \
+          gh release download "$RELEASE_TAG" \
+            --pattern 'CLIProxyAPI_*' \
             --dir "$tmp_dir" \
             --clobber
           (
             cd "$tmp_dir"
             shopt -s nullglob
-            archives=(CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip)
+            archives=(CLIProxyAPI_*)
             if [[ ${#archives[@]} -eq 0 ]]; then
               echo "No release archives found"
               exit 0
@@ -485,7 +523,7 @@ jobs:
               shasum -a 256 "${archives[@]}" | sort -k2 > checksums.txt
             fi
           )
-          gh release upload "$GITHUB_REF_NAME" "$tmp_dir/checksums.txt" --clobber
+          gh release upload "$RELEASE_TAG" "$tmp_dir/checksums.txt" --clobber
 
   build-freebsd:
     name: build ${{ matrix.target }}
@@ -514,6 +552,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -535,7 +574,7 @@ jobs:
         id: metadata
         run: |
           set -euo pipefail
-          release_version="${GITHUB_REF_NAME#v}"
+          release_version="${RELEASE_TAG#v}"
           commit="$(git rev-parse --short HEAD)"
           build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "RELEASE_VERSION=$release_version" >> "$GITHUB_ENV"
@@ -590,6 +629,9 @@ jobs:
 
           echo "Packaging ${archive_name}"
           cp "dist/${TARGET}/bin/cli-proxy-api" "$archive_dir/cli-proxy-api"
+          binary_asset="dist/CLIProxyAPI_${RELEASE_VERSION}_freebsd_${ASSET_ARCH}${ASSET_SUFFIX}"
+          cp "dist/${TARGET}/bin/cli-proxy-api" "$binary_asset"
+          echo "BINARY_ASSET=$binary_asset" >> "$GITHUB_ENV"
           cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/"
           tar -C "$archive_dir" -czf "dist/$archive_name" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml
       - uses: actions/upload-artifact@v4
@@ -604,13 +646,14 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          assets=(dist/CLIProxyAPI_*.tar.gz)
+          assets=(dist/CLIProxyAPI_*.tar.gz "$BINARY_ASSET")
           if [[ ${#assets[@]} -eq 0 ]]; then
-            printf 'expected archive assets, found %s\n' "${#assets[@]}" >&2
+            printf 'expected release assets, found %s\n' "${#assets[@]}" >&2
             printf '%s\n' "${assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          [[ -f "$BINARY_ASSET" ]] || { echo "missing binary asset: $BINARY_ASSET" >&2; exit 1; }
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
       - name: Refresh release checksums
         continue-on-error: true
         shell: bash
@@ -620,15 +663,14 @@ jobs:
           set -euo pipefail
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
-          gh release download "$GITHUB_REF_NAME" \
-            --pattern 'CLIProxyAPI_*.tar.gz' \
-            --pattern 'CLIProxyAPI_*.zip' \
+          gh release download "$RELEASE_TAG" \
+            --pattern 'CLIProxyAPI_*' \
             --dir "$tmp_dir" \
             --clobber
           (
             cd "$tmp_dir"
             shopt -s nullglob
-            archives=(CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip)
+            archives=(CLIProxyAPI_*)
             if [[ ${#archives[@]} -eq 0 ]]; then
               echo "No release archives found"
               exit 0
@@ -639,7 +681,7 @@ jobs:
               shasum -a 256 "${archives[@]}" | sort -k2 > checksums.txt
             fi
           )
-          gh release upload "$GITHUB_REF_NAME" "$tmp_dir/checksums.txt" --clobber
+          gh release upload "$RELEASE_TAG" "$tmp_dir/checksums.txt" --clobber
 
   publish-checksums:
     runs-on: ubuntu-latest
@@ -661,10 +703,10 @@ jobs:
           set -euo pipefail
           cd dist
           shopt -s nullglob
-          archives=(CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip)
+          archives=(CLIProxyAPI_*)
           if [[ ${#archives[@]} -eq 0 ]]; then
             echo "No release archives found"
             exit 0
           fi
           sha256sum "${archives[@]}" | sort -k2 > checksums.txt
-          gh release upload "$GITHUB_REF_NAME" checksums.txt --clobber
+          gh release upload "$RELEASE_TAG" checksums.txt --clobber
