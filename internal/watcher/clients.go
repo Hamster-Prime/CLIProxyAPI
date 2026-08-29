@@ -57,7 +57,8 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 	}
 
 	geminiAPIKeyCount, vertexCompatAPIKeyCount, claudeAPIKeyCount, codexAPIKeyCount, xaiAPIKeyCount, openAICompatCount := BuildAPIKeyClients(cfg)
-	totalAPIKeyClients := geminiAPIKeyCount + vertexCompatAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + openAICompatCount
+	customProviderCount := BuildCustomProviderClients(cfg)
+	totalAPIKeyClients := geminiAPIKeyCount + vertexCompatAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + openAICompatCount + customProviderCount
 	log.Debugf("loaded %d API key clients", totalAPIKeyClients)
 
 	var authFileCount int
@@ -139,7 +140,7 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 		w.authRescanMu.Unlock()
 	}
 
-	totalNewClients := authFileCount + geminiAPIKeyCount + vertexCompatAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + openAICompatCount
+	totalNewClients := authFileCount + geminiAPIKeyCount + vertexCompatAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + openAICompatCount + customProviderCount
 
 	if w.reloadCallback != nil {
 		log.Debugf("triggering server update callback before auth refresh")
@@ -149,7 +150,7 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 	w.refreshAuthState(forceAuthRefresh)
 	redisqueue.NotifyUsageRefresh()
 
-	log.Infof("full client load complete - %d clients (%d auth files + %d Gemini API keys + %d Vertex API keys + %d Claude API keys + %d Codex keys + %d xAI keys + %d OpenAI-compat)",
+	log.Infof("full client load complete - %d clients (%d auth files + %d Gemini API keys + %d Vertex API keys + %d Claude API keys + %d Codex keys + %d xAI keys + %d OpenAI-compat + %d custom-provider)",
 		totalNewClients,
 		authFileCount,
 		geminiAPIKeyCount,
@@ -158,6 +159,7 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 		codexAPIKeyCount,
 		xaiAPIKeyCount,
 		openAICompatCount,
+		customProviderCount,
 	)
 }
 
@@ -384,6 +386,9 @@ func (w *Watcher) loadFileClients(cfg *config.Config) int {
 }
 
 func BuildAPIKeyClients(cfg *config.Config) (int, int, int, int, int, int) {
+	if cfg == nil {
+		return 0, 0, 0, 0, 0, 0
+	}
 	geminiAPIKeyCount := 0
 	vertexCompatAPIKeyCount := 0
 	claudeAPIKeyCount := 0
@@ -418,6 +423,23 @@ func BuildAPIKeyClients(cfg *config.Config) (int, int, int, int, int, int) {
 		}
 	}
 	return geminiAPIKeyCount, vertexCompatAPIKeyCount, claudeAPIKeyCount, codexAPIKeyCount, xaiAPIKeyCount, openAICompatCount
+}
+
+// BuildCustomProviderClients counts active API keys configured for custom providers.
+// It is kept separate from BuildAPIKeyClients to preserve that function's public
+// six-counter signature for existing embedders.
+func BuildCustomProviderClients(cfg *config.Config) int {
+	if cfg == nil {
+		return 0
+	}
+	count := 0
+	for _, provider := range cfg.CustomProvider {
+		if provider.Disabled {
+			continue
+		}
+		count += len(provider.APIKeyEntries)
+	}
+	return count
 }
 
 func (w *Watcher) persistConfigAsync() {

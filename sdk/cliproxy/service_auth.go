@@ -340,11 +340,27 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 	}
 	id = strings.TrimSpace(id)
 	var provider string
+	var removedCustomProviderKey string
 	if existing, ok := s.coreManager.GetByID(id); ok && existing != nil {
 		provider = strings.TrimSpace(existing.Provider)
+		if providerKey, _, _, okCustom := customProviderInfoFromAuth(existing); okCustom {
+			removedCustomProviderKey = providerKey
+		}
 	}
 	GlobalModelRegistry().UnregisterClient(id)
 	s.coreManager.Remove(ctx, id)
+	if removedCustomProviderKey != "" {
+		stillUsed := false
+		for _, remaining := range s.coreManager.List() {
+			if providerKey, _, _, okCustom := customProviderInfoFromAuth(remaining); okCustom && strings.EqualFold(providerKey, removedCustomProviderKey) {
+				stillUsed = true
+				break
+			}
+		}
+		if !stillUsed {
+			s.coreManager.UnregisterExecutor(removedCustomProviderKey)
+		}
+	}
 	if strings.EqualFold(provider, "codex") {
 		executor.CloseCodexWebsocketSessionsForAuthID(id, "auth_removed")
 	}
@@ -432,4 +448,38 @@ func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName 
 		return util.OpenAICompatibleProviderKey(providerKey), compatName, true
 	}
 	return "", "", false
+}
+
+// customProviderInfoFromAuth identifies config-backed custom-provider auths.
+// The explicit marker is preferred; the namespace fallback keeps manually
+// constructed auths and Home snapshots routable as well.
+func customProviderInfoFromAuth(a *coreauth.Auth) (providerKey, providerName, protocol string, ok bool) {
+	if a == nil {
+		return "", "", "", false
+	}
+	attrs := a.Attributes
+	if attrs != nil {
+		providerKey = strings.TrimSpace(attrs["provider_key"])
+		providerName = strings.TrimSpace(attrs["custom_name"])
+		if providerName == "" {
+			providerName = strings.TrimSpace(attrs["custom_service"])
+		}
+		protocol = strings.TrimSpace(attrs["protocol"])
+		marked := strings.EqualFold(strings.TrimSpace(attrs["custom_provider"]), "true")
+		if marked || util.IsCustomProviderKey(providerKey) {
+			if providerKey == "" {
+				providerKey = util.CustomProviderKey(providerName)
+			}
+			if providerName == "" {
+				providerName = strings.TrimPrefix(strings.ToLower(providerKey), "custom-provider:")
+			}
+			return strings.ToLower(strings.TrimSpace(providerKey)), providerName, protocol, true
+		}
+	}
+	if util.IsCustomProviderKey(a.Provider) {
+		providerKey = util.CustomProviderKey(a.Provider)
+		providerName = strings.TrimPrefix(providerKey, "custom-provider:")
+		return providerKey, providerName, protocol, true
+	}
+	return "", "", "", false
 }

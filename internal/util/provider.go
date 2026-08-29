@@ -14,6 +14,25 @@ import (
 
 const openAICompatibleProviderPrefix = "openai-compatible-"
 
+// CustomProviderKey returns the executor/model-registry key for a custom provider.
+// Custom providers are kept in their own namespace so they cannot be mistaken for
+// the legacy OpenAI-compatible provider family.
+func CustomProviderKey(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return "custom-provider"
+	}
+	if strings.HasPrefix(name, "custom-provider:") {
+		return name
+	}
+	return "custom-provider:" + name
+}
+
+// IsCustomProviderKey reports whether key belongs to the custom-provider namespace.
+func IsCustomProviderKey(key string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(key)), "custom-provider:")
+}
+
 // OpenAICompatibleProviderKey returns the internal provider key for an OpenAI-compatible provider.
 func OpenAICompatibleProviderKey(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))

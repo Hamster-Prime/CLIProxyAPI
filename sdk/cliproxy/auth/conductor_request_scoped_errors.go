@@ -117,6 +117,11 @@ func extractRequestScopedErrorRules(auth *Auth, cfg *internalconfig.Config) []in
 		providerKey = auth.Attributes["provider_key"]
 		compatName = auth.Attributes["compat_name"]
 	}
+	if isConfiguredCustomProviderAuth(auth) {
+		if entry := customProviderConfigForAuth(cfg, auth); entry != nil {
+			return entry.RequestScopedErrors
+		}
+	}
 	if compatName == "" {
 		if strings.HasPrefix(provider, "openai-compatible-") {
 			compatName = strings.TrimPrefix(provider, "openai-compatible-")

@@ -56,6 +56,9 @@ func isConfiguredOpenAICompatAuth(auth *Auth) bool {
 	if !isConfiguredModelRoutingAuth(auth) {
 		return false
 	}
+	if isConfiguredCustomProviderAuth(auth) {
+		return false
+	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
 		return true
 	}
@@ -65,9 +68,69 @@ func isConfiguredOpenAICompatAuth(auth *Auth) bool {
 	return strings.TrimSpace(auth.Attributes["compat_name"]) != ""
 }
 
+func isConfiguredCustomProviderAuth(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if util.IsCustomProviderKey(auth.Provider) {
+		return true
+	}
+	if auth.Attributes == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Attributes["custom_provider"]), "true") ||
+		util.IsCustomProviderKey(auth.Attributes["provider_key"])
+}
+
+func customProviderKey(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if key := strings.TrimSpace(auth.Attributes["provider_key"]); key != "" && util.IsCustomProviderKey(key) {
+			return util.CustomProviderKey(key)
+		}
+	}
+	return util.CustomProviderKey(auth.Provider)
+}
+
+func customProviderConfigForAuth(cfg *internalconfig.Config, auth *Auth) *internalconfig.CustomProvider {
+	if cfg == nil || auth == nil {
+		return nil
+	}
+	if auth.Attributes != nil {
+		if index, errIndex := strconv.Atoi(strings.TrimSpace(auth.Attributes[AttributeConfigIndex])); errIndex == nil && index >= 0 && index < len(cfg.CustomProvider) {
+			entry := &cfg.CustomProvider[index]
+			if !entry.Disabled {
+				return entry
+			}
+		}
+	}
+	name := ""
+	if auth.Attributes != nil {
+		name = strings.TrimSpace(auth.Attributes["custom_name"])
+		if name == "" {
+			name = strings.TrimSpace(auth.Attributes["custom_service"])
+		}
+	}
+	if name == "" {
+		name = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(auth.Provider)), "custom-provider:")
+	}
+	for i := range cfg.CustomProvider {
+		entry := &cfg.CustomProvider[i]
+		if !entry.Disabled && strings.EqualFold(strings.TrimSpace(entry.Name), name) {
+			return entry
+		}
+	}
+	return nil
+}
+
 func openAICompatProviderKey(auth *Auth) string {
 	if auth == nil {
 		return ""
+	}
+	if isConfiguredCustomProviderAuth(auth) {
+		return customProviderKey(auth)
 	}
 	if auth.Attributes != nil {
 		if providerKey := strings.TrimSpace(auth.Attributes["provider_key"]); providerKey != "" {
@@ -133,6 +196,17 @@ func (m *Manager) resolveOpenAICompatUpstreamModelPool(auth *Auth, requestedMode
 }
 
 func resolveOpenAICompatUpstreamModelPool(cfg *internalconfig.Config, auth *Auth, requestedModel string) []string {
+	if isConfiguredCustomProviderAuth(auth) {
+		requestedModel = strings.TrimSpace(requestedModel)
+		if requestedModel == "" {
+			return nil
+		}
+		entry := customProviderConfigForAuth(cfg, auth)
+		if entry == nil {
+			return nil
+		}
+		return resolveModelAliasPoolFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
+	}
 	if !isConfiguredOpenAICompatAuth(auth) {
 		return nil
 	}
@@ -418,6 +492,12 @@ func configuredModelAliasEntries(cfg *internalconfig.Config, auth *Auth) []model
 			models = asModelAliasEntries(entry.Models)
 		}
 	default:
+		if isConfiguredCustomProviderAuth(auth) {
+			if entry := customProviderConfigForAuth(cfg, auth); entry != nil {
+				models = asModelAliasEntries(entry.Models)
+			}
+			break
+		}
 		providerKey := ""
 		compatName := ""
 		if auth.Attributes != nil {
@@ -574,6 +654,12 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
 			}
 		default:
+			if isConfiguredCustomProviderAuth(auth) {
+				if entry := customProviderConfigForAuth(cfg, auth); entry != nil {
+					compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+				}
+				break
+			}
 			// OpenAI-compat uses config selection from auth.Attributes.
 			providerKey := ""
 			compatName := ""
@@ -693,8 +779,14 @@ func (m *Manager) applyAPIKeyModelAliasWithRouting(routing *apiKeyModelRoutingSn
 		upstreamModel = resolveUpstreamModelForXAIAPIKey(cfg, auth, requestedModel)
 	case "vertex":
 		upstreamModel = resolveUpstreamModelForVertexAPIKey(cfg, auth, requestedModel)
+	case "custom-provider":
+		upstreamModel = resolveUpstreamModelForCustomProviderAPIKey(cfg, auth, requestedModel)
 	default:
-		upstreamModel = resolveUpstreamModelForOpenAICompatAPIKey(cfg, auth, requestedModel)
+		if strings.HasPrefix(provider, "custom-provider:") {
+			upstreamModel = resolveUpstreamModelForCustomProviderAPIKey(cfg, auth, requestedModel)
+		} else {
+			upstreamModel = resolveUpstreamModelForOpenAICompatAPIKey(cfg, auth, requestedModel)
+		}
 	}
 
 	// Return upstream model if found, otherwise return requested model.
@@ -859,6 +951,14 @@ func resolveUpstreamModelForOpenAICompatAPIKey(cfg *internalconfig.Config, auth 
 		return ""
 	}
 	entry := resolveOpenAICompatConfigForAuth(cfg, auth, providerKey, compatName)
+	if entry == nil {
+		return ""
+	}
+	return resolveModelAliasFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
+}
+
+func resolveUpstreamModelForCustomProviderAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
+	entry := customProviderConfigForAuth(cfg, auth)
 	if entry == nil {
 		return ""
 	}

@@ -33,7 +33,7 @@ func isConfiguredModelRoutingAuth(auth *Auth) bool {
 	if auth == nil || auth.AuthSourceKind() != AuthSourceConfig || auth.Attributes == nil {
 		return false
 	}
-	return strings.TrimSpace(auth.Attributes["compat_name"]) != ""
+	return strings.TrimSpace(auth.Attributes["compat_name"]) != "" || isConfiguredCustomProviderAuth(auth)
 }
 
 func (m *Manager) loadAPIKeyModelRouting() *apiKeyModelRoutingSnapshot {
@@ -181,6 +181,12 @@ func compileAPIKeyModelCapabilitiesForAuth(cfg *internalconfig.Config, auth *Aut
 			compileConfiguredModelCapabilities(out, entry.Models, "gemini")
 		}
 	default:
+		if isConfiguredCustomProviderAuth(auth) {
+			if entry := customProviderConfigForAuth(cfg, auth); entry != nil {
+				compileCustomProviderModelCapabilities(out, entry.Models)
+			}
+			break
+		}
 		providerKey, compatName := "", ""
 		if auth.Attributes != nil {
 			providerKey = strings.TrimSpace(auth.Attributes["provider_key"])
@@ -217,6 +223,20 @@ func compileOpenAICompatibleModelCapabilities(out map[string][]apiKeyModelCapabi
 			support = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 		}
 		addConfiguredModelCapability(out, models[i].Name, models[i].Alias, "openai-compatibility", support, models[i].IsCompat)
+	}
+}
+
+func compileCustomProviderModelCapabilities(out map[string][]apiKeyModelCapabilityRoute, models []internalconfig.CustomProviderModel) {
+	for i := range models {
+		support := models[i].Thinking
+		if support == nil && !models[i].Image {
+			support = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
+		}
+		modelType := "custom-provider"
+		if models[i].Image {
+			modelType = registry.OpenAIImageModelType
+		}
+		addConfiguredModelCapability(out, models[i].Name, models[i].Alias, modelType, support, models[i].IsCompat)
 	}
 }
 

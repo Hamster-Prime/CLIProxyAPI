@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
@@ -747,3 +748,117 @@ func (m OpenAICompatibilityModel) GetForceMapping() bool    { return m.ForceMapp
 func (m OpenAICompatibilityModel) GetIsCompat() bool        { return m.IsCompat }
 
 func (m OpenAICompatibilityModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
+
+// CustomProviderProtocol identifies the wire protocol used by a custom provider.
+// The values are intentionally configuration-oriented; the runtime maps them to
+// the corresponding translator format.
+const (
+	CustomProviderProtocolCompletions = "completions"
+	CustomProviderProtocolResponses   = "responses"
+	CustomProviderProtocolMessages    = "messages"
+)
+
+// NormalizeCustomProviderProtocol canonicalizes a custom provider protocol.
+// Empty values default to OpenAI Chat Completions for backward-compatible
+// behavior. Unknown values are returned in trimmed lower-case form so callers
+// can report a validation error without losing the operator's input.
+func NormalizeCustomProviderProtocol(raw string) string {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	switch value {
+	case "":
+		return CustomProviderProtocolCompletions
+	case CustomProviderProtocolCompletions, "completion", "chat", "chat-completions", "openai", "openai-completion", "openai-completions":
+		return CustomProviderProtocolCompletions
+	case CustomProviderProtocolResponses, "response", "openai-response", "openai-responses":
+		return CustomProviderProtocolResponses
+	case CustomProviderProtocolMessages, "message", "anthropic", "anthropic-message", "anthropic-messages", "claude":
+		return CustomProviderProtocolMessages
+	default:
+		return value
+	}
+}
+
+// ValidateCustomProviderProtocol validates one custom provider protocol value.
+func ValidateCustomProviderProtocol(raw string) error {
+	value := NormalizeCustomProviderProtocol(raw)
+	switch value {
+	case CustomProviderProtocolCompletions, CustomProviderProtocolResponses, CustomProviderProtocolMessages:
+		return nil
+	default:
+		return fmt.Errorf("protocol must be one of %q, %q, or %q", CustomProviderProtocolCompletions, CustomProviderProtocolResponses, CustomProviderProtocolMessages)
+	}
+}
+
+// ValidateCustomProviderProtocols validates all custom provider names and protocol values.
+func (cfg *Config) ValidateCustomProviderProtocols() error {
+	if cfg == nil {
+		return nil
+	}
+	seenNames := make(map[string]int, len(cfg.CustomProvider))
+	for index := range cfg.CustomProvider {
+		provider := &cfg.CustomProvider[index]
+		name := strings.TrimSpace(provider.Name)
+		if name == "" {
+			return fmt.Errorf("custom-provider[%d].name: name is required", index)
+		}
+		nameKey := strings.ToLower(name)
+		if previous, exists := seenNames[nameKey]; exists {
+			return fmt.Errorf("custom-provider[%d].name: duplicates custom-provider[%d]", index, previous)
+		}
+		seenNames[nameKey] = index
+		if errValidate := ValidateCustomProviderProtocol(provider.Protocol); errValidate != nil {
+			return fmt.Errorf("custom-provider[%d].protocol: %w", index, errValidate)
+		}
+	}
+	return nil
+}
+
+// CustomProvider represents a configurable external provider with a selectable
+// upstream protocol. Its API key and model mappings intentionally mirror
+// OpenAICompatibility.
+type CustomProvider struct {
+	// Name is the identifier for this custom provider configuration.
+	Name string `yaml:"name" json:"name"`
+
+	// Priority controls selection preference when multiple providers or credentials match.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
+
+	// Disabled prevents this provider from being used for routing.
+	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
+
+	// Prefix optionally namespaces model aliases for this provider.
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
+
+	// Protocol selects the upstream wire format: completions, responses, or messages.
+	Protocol string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
+
+	// BaseURL is the base URL for the external provider endpoint.
+	BaseURL string `yaml:"base-url" json:"base-url"`
+
+	// APIKeyEntries defines API keys with optional per-key proxy configuration.
+	APIKeyEntries []CustomProviderAPIKey `yaml:"api-key-entries,omitempty" json:"api-key-entries,omitempty"`
+
+	// Models defines model names and aliases for request routing.
+	Models []CustomProviderModel `yaml:"models" json:"models"`
+
+	// Headers optionally adds extra HTTP headers for requests sent to this provider.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+
+	// SupportPromptCacheKey enables derived prompt_cache_key injection for supported requests.
+	SupportPromptCacheKey bool `yaml:"support-prompt-cache-key,omitempty" json:"support-prompt-cache-key,omitempty"`
+
+	// DisableCooling overrides the global cooling policy for this provider when set.
+	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// RequestRetry optionally overrides the global request-retry for this provider.
+	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
+
+	// RequestScopedErrors configures custom classification rules for upstream errors.
+	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
+}
+
+// CustomProviderAPIKey mirrors OpenAICompatibilityAPIKey for custom providers.
+type CustomProviderAPIKey = OpenAICompatibilityAPIKey
+
+// CustomProviderModel mirrors OpenAICompatibilityModel for custom providers.
+type CustomProviderModel = OpenAICompatibilityModel

@@ -588,6 +588,13 @@ func proxyURLFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
 	if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
 		return resolveOpenAICompatAPIKeyProxyURL(cfg, auth, strings.TrimSpace(authAccount), providerKey, compatName)
 	}
+	customName := ""
+	if len(attrs) > 0 {
+		customName = strings.TrimSpace(attrs["custom_name"])
+	}
+	if customName != "" || strings.EqualFold(strings.TrimSpace(attrs["custom_provider"]), "true") || strings.HasPrefix(strings.ToLower(strings.TrimSpace(auth.Provider)), "custom-provider:") {
+		return resolveCustomProviderAPIKeyProxyURL(cfg, auth, strings.TrimSpace(authAccount), providerKey, customName)
+	}
 
 	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
 	case "gemini":
@@ -648,6 +655,50 @@ func resolveOpenAICompatAPIKeyProxyURL(cfg *config.Config, auth *coreauth.Auth, 
 				}
 				return ""
 			}
+		}
+	}
+	return ""
+}
+
+func resolveCustomProviderAPIKeyProxyURL(cfg *config.Config, auth *coreauth.Auth, apiKey, providerKey, providerName string) string {
+	if cfg == nil || auth == nil {
+		return ""
+	}
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return ""
+	}
+	candidates := make([]string, 0, 3)
+	if v := strings.TrimSpace(providerName); v != "" {
+		candidates = append(candidates, v)
+	}
+	if v := strings.TrimSpace(providerKey); v != "" {
+		candidates = append(candidates, v)
+	}
+	if v := strings.TrimSpace(auth.Provider); v != "" {
+		candidates = append(candidates, v)
+	}
+	for i := range cfg.CustomProvider {
+		provider := &cfg.CustomProvider[i]
+		if provider.Disabled {
+			continue
+		}
+		for _, candidate := range candidates {
+			candidate = strings.TrimSpace(candidate)
+			candidateLower := strings.ToLower(candidate)
+			if strings.HasPrefix(candidateLower, "custom-provider:") {
+				candidate = strings.TrimPrefix(candidateLower, "custom-provider:")
+			}
+			if candidate == "" || !strings.EqualFold(candidate, strings.TrimSpace(provider.Name)) {
+				continue
+			}
+			for j := range provider.APIKeyEntries {
+				entry := &provider.APIKeyEntries[j]
+				if strings.EqualFold(strings.TrimSpace(entry.APIKey), apiKey) {
+					return strings.TrimSpace(entry.ProxyURL)
+				}
+			}
+			return ""
 		}
 	}
 	return ""

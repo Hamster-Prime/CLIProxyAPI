@@ -26,6 +26,13 @@ func ComputeOpenAICompatModelsHash(models []config.OpenAICompatibilityModel) str
 	return hashJoined(keys)
 }
 
+// ComputeCustomProviderModelsHash returns a stable hash for custom-provider models.
+func ComputeCustomProviderModelsHash(models []config.CustomProviderModel) string {
+	// CustomProviderModel intentionally mirrors OpenAICompatibilityModel, so use
+	// the same canonical model hash and routing semantics.
+	return ComputeOpenAICompatModelsHash(models)
+}
+
 // ComputeVertexCompatModelsHash returns a stable hash for Vertex-compatible models.
 func ComputeVertexCompatModelsHash(models []config.VertexCompatModel) string {
 	keys := modelRoutingKeys(func(out func(key string)) {

@@ -45,6 +45,12 @@ func validateCredentialWeightYAML(data []byte) error {
 			if errValidate := validateOpenAICompatibilityWeightNodes(value); errValidate != nil {
 				return errValidate
 			}
+			continue
+		}
+		if name == "custom-provider" {
+			if errValidate := validateCustomProviderWeightNodes(value); errValidate != nil {
+				return errValidate
+			}
 		}
 	}
 	return nil
@@ -106,6 +112,27 @@ func validateOpenAICompatibilityWeightNodes(sequence *yaml.Node) error {
 	return nil
 }
 
+func validateCustomProviderWeightNodes(sequence *yaml.Node) error {
+	if sequence == nil || sequence.Kind != yaml.SequenceNode {
+		return nil
+	}
+	for providerIndex, provider := range sequence.Content {
+		if provider == nil || provider.Kind != yaml.MappingNode {
+			continue
+		}
+		for index := 0; index+1 < len(provider.Content); index += 2 {
+			if provider.Content[index].Value != "api-key-entries" {
+				continue
+			}
+			path := fmt.Sprintf("custom-provider[%d].api-key-entries", providerIndex)
+			if errValidate := validateWeightSequenceNode(provider.Content[index+1], path); errValidate != nil {
+				return errValidate
+			}
+		}
+	}
+	return nil
+}
+
 // ValidateCredentialWeights validates weights for every API-key family.
 func (cfg *Config) ValidateCredentialWeights() error {
 	if cfg == nil {
@@ -146,6 +173,14 @@ func (cfg *Config) ValidateCredentialWeights() error {
 			weight := cfg.OpenAICompatibility[providerIndex].APIKeyEntries[keyIndex].Weight
 			if errValidate := ValidateCredentialWeight(weight); errValidate != nil {
 				return fmt.Errorf("openai-compatibility[%d].api-key-entries[%d].weight: %w", providerIndex, keyIndex, errValidate)
+			}
+		}
+	}
+	for providerIndex := range cfg.CustomProvider {
+		for keyIndex := range cfg.CustomProvider[providerIndex].APIKeyEntries {
+			weight := cfg.CustomProvider[providerIndex].APIKeyEntries[keyIndex].Weight
+			if errValidate := ValidateCredentialWeight(weight); errValidate != nil {
+				return fmt.Errorf("custom-provider[%d].api-key-entries[%d].weight: %w", providerIndex, keyIndex, errValidate)
 			}
 		}
 	}

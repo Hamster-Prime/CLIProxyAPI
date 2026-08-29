@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -13,7 +14,7 @@ import (
 )
 
 // ConfigSynthesizer generates Auth entries from configuration API keys.
-// It handles Gemini, Interactions, Claude, Codex, xAI, OpenAI-compat, and Vertex-compat providers.
+// It handles Gemini, Interactions, Claude, Codex, xAI, OpenAI-compat, custom, and Vertex-compat providers.
 type ConfigSynthesizer struct{}
 
 // NewConfigSynthesizer creates a new ConfigSynthesizer instance.
@@ -41,6 +42,9 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	if errValidate := ctx.Config.ValidateCredentialWeights(); errValidate != nil {
 		return nil, fmt.Errorf("synthesize config API key auths: %w", errValidate)
 	}
+	if errValidate := ctx.Config.ValidateCustomProviderProtocols(); errValidate != nil {
+		return nil, fmt.Errorf("synthesize custom provider auths: %w", errValidate)
+	}
 
 	// Gemini API Keys
 	out = append(out, s.synthesizeGeminiKeys(ctx)...)
@@ -54,6 +58,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeXAIKeys(ctx)...)
 	// OpenAI-compat
 	out = append(out, s.synthesizeOpenAICompat(ctx)...)
+	// Custom providers
+	out = append(out, s.synthesizeCustomProviders(ctx)...)
 	// Vertex-compat
 	out = append(out, s.synthesizeVertexCompat(ctx)...)
 
@@ -389,6 +395,100 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 		}
 	}
 	return out
+}
+
+// synthesizeCustomProviders creates Auth entries for custom providers. Each
+// entry carries its selected upstream protocol so runtime routing can dispatch
+// the request without changing the downstream API contract.
+func (s *ConfigSynthesizer) synthesizeCustomProviders(ctx *SynthesisContext) []*coreauth.Auth {
+	cfg := ctx.Config
+	now := ctx.Now
+	idGen := ctx.IDGenerator
+
+	out := make([]*coreauth.Auth, 0)
+	for i := range cfg.CustomProvider {
+		provider := &cfg.CustomProvider[i]
+		if provider.Disabled {
+			continue
+		}
+		providerName := strings.ToLower(strings.TrimSpace(provider.Name))
+		if providerName == "" {
+			providerName = "default"
+		}
+		providerKey := util.CustomProviderKey(providerName)
+		protocol := config.NormalizeCustomProviderProtocol(provider.Protocol)
+		base := strings.TrimSpace(provider.BaseURL)
+		if base == "" {
+			continue
+		}
+		prefix := strings.TrimSpace(provider.Prefix)
+		createdEntries := 0
+		for j := range provider.APIKeyEntries {
+			entry := &provider.APIKeyEntries[j]
+			key := strings.TrimSpace(entry.APIKey)
+			proxyURL := strings.TrimSpace(entry.ProxyURL)
+			id, token := idGen.Next(providerKey, key, base, proxyURL, protocol)
+			auth := s.customProviderAuth(provider, providerName, providerKey, protocol, prefix, base, key, proxyURL, i, token, now, entry.Weight)
+			auth.ID = id
+			out = append(out, auth)
+			createdEntries++
+		}
+		if createdEntries > 0 {
+			continue
+		}
+
+		id, token := idGen.Next(providerKey, base, protocol)
+		auth := s.customProviderAuth(provider, providerName, providerKey, protocol, prefix, base, "", "", i, token, now, nil)
+		auth.ID = id
+		out = append(out, auth)
+	}
+	return out
+}
+
+func (s *ConfigSynthesizer) customProviderAuth(provider *config.CustomProvider, providerName, providerKey, protocol, prefix, base, key, proxyURL string, configIndex int, token string, now time.Time, weight *int) *coreauth.Auth {
+	attrs := map[string]string{
+		"source":          fmt.Sprintf("config:%s[%s]", providerName, token),
+		"custom_provider": "true",
+		"auth_kind":       coreauth.AuthKindAPIKey,
+		"custom_name":     provider.Name,
+		"custom_service":  providerName,
+		"provider_key":    providerKey,
+		"config_index":    strconv.Itoa(configIndex),
+		"protocol":        protocol,
+		"base_url":        base,
+	}
+	metadata := map[string]any{}
+	if provider.DisableCooling != nil {
+		metadata["disable_cooling"] = *provider.DisableCooling
+	}
+	addRequestRetryToMetadata(provider.RequestRetry, metadata)
+	addRequestScopedErrorsToMetadata(provider.RequestScopedErrors, metadata)
+	if provider.Priority != 0 {
+		attrs["priority"] = strconv.Itoa(provider.Priority)
+	}
+	addWeightToAttrs(weight, attrs)
+	if key != "" {
+		attrs["api_key"] = key
+	}
+	if hash := diff.ComputeCustomProviderModelsHash(provider.Models); hash != "" {
+		attrs["models_hash"] = hash
+	}
+	addConfigHeadersToAttrs(provider.Headers, attrs)
+	auth := &coreauth.Auth{
+		Provider:   providerKey,
+		Label:      provider.Name,
+		Prefix:     prefix,
+		Status:     coreauth.StatusActive,
+		ProxyURL:   proxyURL,
+		Attributes: attrs,
+		Metadata:   metadata,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	if len(auth.Metadata) == 0 {
+		auth.Metadata = nil
+	}
+	return auth
 }
 
 // synthesizeVertexCompat creates Auth entries for Vertex-compatible providers.

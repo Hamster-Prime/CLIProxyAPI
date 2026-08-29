@@ -160,3 +160,21 @@ func TestEnsureTokenBreakdownDoesNotOverrideCanonicalZeroCacheRead(t *testing.T)
 		t.Fatalf("detail = %+v", detail)
 	}
 }
+
+func TestEnsureTokenBreakdownForCustomProviderUsesProtocolSemantics(t *testing.T) {
+	openAI := EnsureTokenBreakdownForProviderWithProtocol(
+		Detail{InputTokens: 100, OutputTokens: 30, ReasoningTokens: 12, CacheReadTokens: 40, CacheCreationTokens: 10},
+		"custom-provider:arbitrary-service", "CustomProviderExecutor", "responses",
+	)
+	if openAI.TokenBreakdown.Quality != TokenAccountingQualityComplete || openAI.TotalTokens != 130 {
+		t.Fatalf("responses detail = %+v, want subset accounting", openAI)
+	}
+
+	claude := EnsureTokenBreakdownForProviderWithProtocol(
+		Detail{InputTokens: 100, OutputTokens: 30, ReasoningTokens: 12, CacheReadTokens: 40, CacheCreationTokens: 10},
+		"custom-provider:arbitrary-service", "CustomProviderExecutor", "messages",
+	)
+	if claude.TokenBreakdown.Quality != TokenAccountingQualityComplete || claude.TotalTokens != 192 || claude.TokenBreakdown.Input.TotalTokens != 150 {
+		t.Fatalf("messages detail = %+v, want independent accounting", claude)
+	}
+}

@@ -187,8 +187,35 @@ func (s *Service) registerAvailableExecutors(ctx context.Context, opts executorR
 	}
 	// Keep all Service-owned executor registration paths here so native, Home,
 	// auth-derived, and plugin executors stay in the same binding order.
+	var baseline []*coreauth.Auth
 	if opts.includeBaseline {
-		s.registerExecutorsForAuths(baselineExecutorAuths(), opts.forceReplaceAuths)
+		s.cfgMu.RLock()
+		cfg := s.cfg
+		s.cfgMu.RUnlock()
+		baseline = baselineExecutorAuths()
+		baseline = append(baseline, customProviderBaselineAuths(cfg)...)
+	}
+
+	desiredCustomKeys := make(map[string]struct{})
+	for _, auth := range baseline {
+		if providerKey, _, _, okCustom := customProviderInfoFromAuth(auth); okCustom {
+			desiredCustomKeys[providerKey] = struct{}{}
+		}
+	}
+	for _, auth := range opts.auths {
+		if providerKey, _, _, okCustom := customProviderInfoFromAuth(auth); okCustom {
+			desiredCustomKeys[providerKey] = struct{}{}
+		}
+	}
+	for providerKey := range s.customProviderExecutorKeys {
+		if _, keep := desiredCustomKeys[providerKey]; keep {
+			continue
+		}
+		s.coreManager.UnregisterExecutor(providerKey)
+		delete(s.customProviderExecutorKeys, providerKey)
+	}
+	if len(baseline) > 0 {
+		s.registerExecutorsForAuths(baseline, opts.forceReplaceAuths)
 	}
 	if len(opts.auths) > 0 {
 		s.registerExecutorsForAuths(opts.auths, opts.forceReplaceAuths)
@@ -221,6 +248,35 @@ func baselineExecutorAuths() []*coreauth.Auth {
 			auth.Attributes = map[string]string{"compat_name": "openai-compatibility"}
 		}
 		auths = append(auths, auth)
+	}
+	return auths
+}
+
+func customProviderBaselineAuths(cfg *config.Config) []*coreauth.Auth {
+	if cfg == nil || len(cfg.CustomProvider) == 0 {
+		return nil
+	}
+	auths := make([]*coreauth.Auth, 0, len(cfg.CustomProvider))
+	for index := range cfg.CustomProvider {
+		provider := &cfg.CustomProvider[index]
+		if provider.Disabled || strings.TrimSpace(provider.Name) == "" || strings.TrimSpace(provider.BaseURL) == "" {
+			continue
+		}
+		providerName := strings.TrimSpace(provider.Name)
+		providerKey := util.CustomProviderKey(providerName)
+		auths = append(auths, &coreauth.Auth{
+			Provider: providerKey,
+			Label:    providerName,
+			Attributes: map[string]string{
+				"custom_provider": "true",
+				"custom_name":     providerName,
+				"custom_service":  strings.ToLower(providerName),
+				"provider_key":    providerKey,
+				"config_index":    strconv.Itoa(index),
+				"protocol":        config.NormalizeCustomProviderProtocol(provider.Protocol),
+				"base_url":        strings.TrimSpace(provider.BaseURL),
+			},
+		})
 	}
 	return auths
 }
@@ -262,6 +318,13 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 	// Disabled auths can linger during config reloads (e.g., removed OpenAI-compat entries)
 	// and must not override active provider executors.
 	if a.Disabled {
+		return
+	}
+	if providerKey, providerName, protocol, isCustom := customProviderInfoFromAuth(a); isCustom {
+		if protocol == "" {
+			protocol = customProviderProtocolForAuth(cfg, a, providerName)
+		}
+		s.registerCustomProviderExecutor(providerKey, protocol, cfg, forceReplace)
 		return
 	}
 	if compatProviderKey, _, isCompat := openAICompatInfoFromAuth(a); isCompat {
@@ -318,6 +381,49 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 		// OAuth refresh to the plugin AuthProvider when one is registered.
 		s.registerOpenAICompatProviderExecutor(providerKey, a, cfg, forceReplace, true)
 	}
+}
+
+func customProviderProtocolForAuth(cfg *config.Config, auth *coreauth.Auth, providerName string) string {
+	if auth != nil && auth.Attributes != nil {
+		if protocol := strings.TrimSpace(auth.Attributes["protocol"]); protocol != "" {
+			return config.NormalizeCustomProviderProtocol(protocol)
+		}
+	}
+	if cfg == nil {
+		return config.CustomProviderProtocolCompletions
+	}
+	if auth != nil && auth.Attributes != nil {
+		if index, errIndex := strconv.Atoi(strings.TrimSpace(auth.Attributes[coreauth.AttributeConfigIndex])); errIndex == nil && index >= 0 && index < len(cfg.CustomProvider) {
+			return config.NormalizeCustomProviderProtocol(cfg.CustomProvider[index].Protocol)
+		}
+	}
+	for i := range cfg.CustomProvider {
+		if strings.EqualFold(strings.TrimSpace(cfg.CustomProvider[i].Name), strings.TrimSpace(providerName)) {
+			return config.NormalizeCustomProviderProtocol(cfg.CustomProvider[i].Protocol)
+		}
+	}
+	return config.CustomProviderProtocolCompletions
+}
+
+func (s *Service) registerCustomProviderExecutor(providerKey, protocol string, cfg *config.Config, forceReplace bool) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	providerKey = util.CustomProviderKey(providerKey)
+	protocol = config.NormalizeCustomProviderProtocol(protocol)
+	next := executor.NewCustomProviderExecutor(providerKey, protocol, cfg)
+	if !forceReplace {
+		if existing, ok := s.coreManager.Executor(providerKey); ok {
+			if custom, okCustom := existing.(*executor.CustomProviderExecutor); okCustom && custom != nil && custom.Protocol() == protocol {
+				return
+			}
+		}
+	}
+	s.coreManager.RegisterExecutor(next)
+	if s.customProviderExecutorKeys == nil {
+		s.customProviderExecutorKeys = make(map[string]struct{})
+	}
+	s.customProviderExecutorKeys[providerKey] = struct{}{}
 }
 
 // registerOpenAICompatProviderExecutor binds a native OpenAI-compat executor, optionally

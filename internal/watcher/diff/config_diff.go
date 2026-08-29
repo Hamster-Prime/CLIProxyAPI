@@ -415,6 +415,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			changes = append(changes, "  "+c)
 		}
 	}
+	if custom := DiffCustomProviders(oldCfg.CustomProvider, newCfg.CustomProvider); len(custom) > 0 {
+		changes = append(changes, "custom-provider:")
+		for _, change := range custom {
+			changes = append(changes, "  "+change)
+		}
+	}
 
 	// Vertex-compatible API keys
 	if len(oldCfg.VertexCompatAPIKey) != len(newCfg.VertexCompatAPIKey) {

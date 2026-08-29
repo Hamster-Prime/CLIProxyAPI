@@ -54,6 +54,28 @@ type openAICompatibilityWithAuthIndex struct {
 	AuthIndex             string                                   `json:"auth-index,omitempty"`
 }
 
+type customProviderAPIKeyWithAuthIndex struct {
+	config.CustomProviderAPIKey
+	AuthIndex string `json:"auth-index,omitempty"`
+}
+
+type customProviderWithAuthIndex struct {
+	Name                  string                              `json:"name"`
+	Priority              int                                 `json:"priority,omitempty"`
+	Disabled              bool                                `json:"disabled"`
+	Prefix                string                              `json:"prefix,omitempty"`
+	Protocol              string                              `json:"protocol"`
+	BaseURL               string                              `json:"base-url"`
+	APIKeyEntries         []customProviderAPIKeyWithAuthIndex `json:"api-key-entries,omitempty"`
+	Models                []config.CustomProviderModel        `json:"models,omitempty"`
+	Headers               map[string]string                   `json:"headers,omitempty"`
+	SupportPromptCacheKey bool                                `json:"support-prompt-cache-key,omitempty"`
+	DisableCooling        *bool                               `json:"disable-cooling,omitempty"`
+	RequestRetry          *int                                `json:"request-retry,omitempty"`
+	RequestScopedErrors   []config.RequestScopedErrorRule     `json:"request-scoped-errors,omitempty"`
+	AuthIndex             string                              `json:"auth-index,omitempty"`
+}
+
 func (h *Handler) liveAuthIndexByID() map[string]string {
 	out := map[string]string{}
 	if h == nil {
@@ -325,6 +347,63 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 				response.APIKeyEntries[j] = openAICompatibilityAPIKeyWithAuthIndex{
 					OpenAICompatibilityAPIKey: apiKeyEntry,
 					AuthIndex:                 liveIndexByID[id],
+				}
+			}
+		}
+		out[i] = response
+	}
+	return out
+}
+
+func (h *Handler) customProvidersWithAuthIndex() []customProviderWithAuthIndex {
+	if h == nil {
+		return nil
+	}
+	liveIndexByID := h.liveAuthIndexByID()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return nil
+	}
+
+	normalized := normalizedCustomProviderEntries(h.cfg.CustomProvider)
+	out := make([]customProviderWithAuthIndex, len(normalized))
+	idGen := synthesizer.NewStableIDGenerator()
+	for i := range normalized {
+		entry := normalized[i]
+		providerName := strings.ToLower(strings.TrimSpace(entry.Name))
+		if providerName == "" {
+			providerName = "default"
+		}
+		idKind := fmt.Sprintf("custom-provider:%s", providerName)
+		protocol := config.NormalizeCustomProviderProtocol(entry.Protocol)
+
+		response := customProviderWithAuthIndex{
+			Name:                  entry.Name,
+			Priority:              entry.Priority,
+			Disabled:              entry.Disabled,
+			Prefix:                entry.Prefix,
+			Protocol:              protocol,
+			BaseURL:               entry.BaseURL,
+			Models:                entry.Models,
+			Headers:               entry.Headers,
+			SupportPromptCacheKey: entry.SupportPromptCacheKey,
+			DisableCooling:        entry.DisableCooling,
+			RequestRetry:          entry.RequestRetry,
+			RequestScopedErrors:   entry.RequestScopedErrors,
+		}
+		if len(entry.APIKeyEntries) == 0 {
+			id, _ := idGen.Next(idKind, entry.BaseURL, protocol)
+			response.AuthIndex = liveIndexByID[id]
+		} else {
+			response.APIKeyEntries = make([]customProviderAPIKeyWithAuthIndex, len(entry.APIKeyEntries))
+			for j := range entry.APIKeyEntries {
+				apiKeyEntry := entry.APIKeyEntries[j]
+				id, _ := idGen.Next(idKind, apiKeyEntry.APIKey, entry.BaseURL, apiKeyEntry.ProxyURL, protocol)
+				response.APIKeyEntries[j] = customProviderAPIKeyWithAuthIndex{
+					CustomProviderAPIKey: apiKeyEntry,
+					AuthIndex:            liveIndexByID[id],
 				}
 			}
 		}

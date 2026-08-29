@@ -70,6 +70,9 @@ type APIKeyClientResult struct {
 
 	// OpenAICompatCount is the number of OpenAI compatibility API keys loaded
 	OpenAICompatCount int
+
+	// CustomProviderCount is the number of API keys configured under custom-provider.
+	CustomProviderCount int
 }
 
 // WatcherFactory creates a watcher for configuration and token changes.

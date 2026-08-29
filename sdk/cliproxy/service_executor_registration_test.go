@@ -104,6 +104,27 @@ func TestRegisterAvailableExecutors(t *testing.T) {
 	}
 }
 
+func TestRegisterAvailableExecutorsIncludesCustomProviderBaseline(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{CustomProvider: []config.CustomProvider{{
+			Name:     "OpenRouter",
+			Protocol: config.CustomProviderProtocolMessages,
+			BaseURL:  "https://openrouter.example/v1",
+		}}},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	service.registerAvailableExecutors(context.Background(), executorRegistrationOptions{includeBaseline: true})
+	resolved, ok := service.coreManager.Executor("custom-provider:openrouter")
+	if !ok {
+		t.Fatal("custom provider baseline executor was not registered")
+	}
+	custom, ok := resolved.(*runtimeexecutor.CustomProviderExecutor)
+	if !ok || custom.Protocol() != config.CustomProviderProtocolMessages {
+		t.Fatalf("executor = %T with protocol %q, want CustomProviderExecutor/messages", resolved, custom.Protocol())
+	}
+}
+
 func TestSyncPluginModelRuntimePreservesSDKExecutorUnlessForced(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	custom := serviceTestSDKExecutor{}

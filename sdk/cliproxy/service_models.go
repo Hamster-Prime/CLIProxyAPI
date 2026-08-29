@@ -42,8 +42,12 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		}
 	}
 	provider := strings.ToLower(strings.TrimSpace(a.Provider))
+	customProviderKey, customProviderName, _, customDetected := customProviderInfoFromAuth(a)
+	if customDetected {
+		provider = customProviderKey
+	}
 	compatProviderKey, compatDisplayName, compatDetected := openAICompatInfoFromAuth(a)
-	if compatDetected {
+	if compatDetected && !customDetected {
 		provider = "openai-compatibility"
 	}
 	excluded := s.oauthExcludedModels(provider, authKind)
@@ -53,6 +57,22 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		if val, ok := a.Attributes["excluded_models"]; ok && strings.TrimSpace(val) != "" {
 			excluded = strings.Split(val, ",")
 		}
+	}
+	if customDetected {
+		entry := resolveCustomProviderConfigForAuth(s.cfg, a, customProviderName)
+		if entry == nil || entry.Disabled {
+			GlobalModelRegistry().UnregisterClient(a.ID)
+			return
+		}
+		models := buildCustomProviderConfigModels(entry)
+		models = applyExcludedModels(models, excluded)
+		models = s.appendPluginModels(customProviderKey, models)
+		if len(models) > 0 {
+			s.registerResolvedModelsForAuth(a, customProviderKey, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
+		} else {
+			GlobalModelRegistry().UnregisterClient(a.ID)
+		}
+		return
 	}
 	if s.tryRegisterPluginModelsForAuth(ctx, a, provider, authKind, excluded) {
 		return
@@ -724,6 +744,65 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 			modelType = registry.OpenAIImageModelType
 		}
 		info := buildConfiguredModelInfo(model, compat.Name, modelType, now, strings.TrimSpace(model.Alias), false)
+		if info == nil {
+			continue
+		}
+		thinkingSupport := model.Thinking
+		if thinkingSupport == nil && !model.Image {
+			thinkingSupport = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
+		}
+		info.Thinking = modelconfig.NormalizeThinkingSupport(thinkingSupport)
+		info.SupportedInputModalities = normalizeCompatConfigModalities(model.InputModalities)
+		info.SupportedOutputModalities = normalizeCompatConfigModalities(model.OutputModalities)
+		models = append(models, info)
+	}
+	return models
+}
+
+func resolveCustomProviderConfigForAuth(cfg *config.Config, auth *coreauth.Auth, providerName string) *config.CustomProvider {
+	if cfg == nil || auth == nil {
+		return nil
+	}
+	if auth.Attributes != nil {
+		if index, errIndex := strconv.Atoi(strings.TrimSpace(auth.Attributes[coreauth.AttributeConfigIndex])); errIndex == nil && index >= 0 && index < len(cfg.CustomProvider) {
+			entry := &cfg.CustomProvider[index]
+			if !entry.Disabled {
+				return entry
+			}
+		}
+		if name := strings.TrimSpace(auth.Attributes["custom_name"]); name != "" {
+			providerName = name
+		}
+	}
+	providerName = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(providerName)), "custom-provider:")
+	if providerName == "" {
+		providerName = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(auth.Provider)), "custom-provider:")
+	}
+	for i := range cfg.CustomProvider {
+		entry := &cfg.CustomProvider[i]
+		if entry.Disabled {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(entry.Name), providerName) {
+			return entry
+		}
+	}
+	return nil
+}
+
+func buildCustomProviderConfigModels(provider *config.CustomProvider) []*ModelInfo {
+	if provider == nil || len(provider.Models) == 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	models := make([]*ModelInfo, 0, len(provider.Models))
+	for i := range provider.Models {
+		model := provider.Models[i]
+		modelType := "custom-provider"
+		if model.Image {
+			modelType = registry.OpenAIImageModelType
+		}
+		info := buildConfiguredModelInfo(model, provider.Name, modelType, now, strings.TrimSpace(model.Alias), false)
 		if info == nil {
 			continue
 		}

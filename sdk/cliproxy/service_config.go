@@ -103,6 +103,10 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 		log.WithError(errValidate).Warn("rejected config update with invalid credential weights")
 		return configCommit{}
 	}
+	if errValidate := newCfg.ValidateCustomProviderProtocols(); errValidate != nil {
+		log.WithError(errValidate).Warn("rejected config update with invalid custom-provider settings")
+		return configCommit{}
+	}
 
 	s.cfgMu.Lock()
 	s.cfg = newCfg

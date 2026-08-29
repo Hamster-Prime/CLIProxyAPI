@@ -73,6 +73,13 @@ func providerCoolingOverrideForAuth(auth *Auth, cfg *internalconfig.Config) (boo
 		providerKey = strings.TrimSpace(auth.Attributes["provider_key"])
 		compatName = strings.TrimSpace(auth.Attributes["compat_name"])
 	}
+	if isConfiguredCustomProviderAuth(auth) {
+		entry := customProviderConfigForAuth(cfg, auth)
+		if entry == nil || entry.DisableCooling == nil {
+			return false, false
+		}
+		return *entry.DisableCooling, true
+	}
 	if providerKey == "" && compatName == "" && provider != "openai-compatibility" {
 		return false, false
 	}

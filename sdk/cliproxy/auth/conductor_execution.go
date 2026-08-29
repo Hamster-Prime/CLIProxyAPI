@@ -1470,6 +1470,18 @@ func executorKeyFromAuth(auth *Auth) string {
 		return ""
 	}
 	if auth.Attributes != nil {
+		if strings.EqualFold(strings.TrimSpace(auth.Attributes["custom_provider"]), "true") || util.IsCustomProviderKey(auth.Attributes["provider_key"]) {
+			providerKey := strings.TrimSpace(auth.Attributes["provider_key"])
+			if providerKey == "" {
+				providerKey = auth.Provider
+			}
+			return util.CustomProviderKey(providerKey)
+		}
+	}
+	if util.IsCustomProviderKey(auth.Provider) {
+		return util.CustomProviderKey(auth.Provider)
+	}
+	if auth.Attributes != nil {
 		providerKey := strings.TrimSpace(auth.Attributes["provider_key"])
 		compatName := strings.TrimSpace(auth.Attributes["compat_name"])
 		if compatName != "" {

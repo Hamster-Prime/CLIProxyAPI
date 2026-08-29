@@ -24,6 +24,7 @@ import (
 type UsageReporter struct {
 	provider        string
 	executorType    string
+	protocol        string
 	model           string
 	alias           string
 	authID          string
@@ -55,6 +56,9 @@ func NewExecutorUsageReporter(ctx context.Context, executor usageExecutor, model
 	}
 	reporter := NewUsageReporter(ctx, provider, model, auth)
 	reporter.executorType = ExecutorTypeName(executor)
+	if protocolExecutor, ok := executor.(interface{ Protocol() string }); ok && protocolExecutor != nil {
+		reporter.protocol = strings.TrimSpace(protocolExecutor.Protocol())
+	}
 	return reporter
 }
 
@@ -199,7 +203,7 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 	if model == "" {
 		return usage.Record{}, false
 	}
-	detail = normalizeUsageDetailTotal(detail, r.provider, r.executorType)
+	detail = normalizeUsageDetailTotalWithProtocol(detail, r.provider, r.executorType, r.protocol)
 	if !hasNonZeroTokenUsage(detail) {
 		return usage.Record{}, false
 	}
@@ -227,14 +231,18 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	if r == nil {
 		return
 	}
-	detail = normalizeUsageDetailTotal(detail, r.provider, r.executorType)
+	detail = normalizeUsageDetailTotalWithProtocol(detail, r.provider, r.executorType, r.protocol)
 	r.once.Do(func() {
 		r.publishRecord(ctx, r.buildRecord(detail, failed, fail))
 	})
 }
 
 func normalizeUsageDetailTotal(detail usage.Detail, provider, executorType string) usage.Detail {
-	return usage.EnsureTokenBreakdownForProvider(detail, provider, executorType)
+	return normalizeUsageDetailTotalWithProtocol(detail, provider, executorType, "")
+}
+
+func normalizeUsageDetailTotalWithProtocol(detail usage.Detail, provider, executorType, protocol string) usage.Detail {
+	return usage.EnsureTokenBreakdownForProviderWithProtocol(detail, provider, executorType, protocol)
 }
 
 func hasNonZeroTokenUsage(detail usage.Detail) bool {
@@ -518,6 +526,21 @@ func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
 		detail.ResponseServiceTier = extractResponseServiceTierFromValidJSON(payload)
 	}
 	b.Observe(detail, usageOK || detail.ResponseServiceTier != "")
+}
+
+// ObserveOpenAIResponseStream records usage from an OpenAI Responses SSE frame.
+// Responses places usage under response.usage rather than the top-level usage
+// object used by Chat Completions.
+func (b *StreamUsageBuffer) ObserveOpenAIResponseStream(line []byte) {
+	if b == nil {
+		return
+	}
+	payload := jsonPayload(line)
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return
+	}
+	detail, ok := ParseCodexUsage(payload)
+	b.Observe(detail, ok)
 }
 
 // Publish emits the latest observed usage detail, if any.

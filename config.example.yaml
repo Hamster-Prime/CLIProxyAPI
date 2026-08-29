@@ -659,6 +659,35 @@ nonstream-keepalive-interval: 0
 #       - name: "kimi-k2.5"
 #         alias: "claude-opus-4.66"
 
+# Custom providers
+# Each entry uses the same API key/model mapping as openai-compatibility, but
+# can select its own upstream protocol: completions (default), responses, or messages.
+# custom-provider:
+#   - name: "deepseek"
+#     protocol: "completions"
+#     base-url: "https://api.deepseek.com/v1"
+#     api-key-entries:
+#       - api-key: "sk-..."
+#     models:
+#       - name: "deepseek-chat"
+#         alias: "deepseek-chat"
+#   - name: "openrouter"
+#     protocol: "messages"
+#     base-url: "https://openrouter.ai/api/v1"
+#     api-key-entries:
+#       - api-key: "sk-or-v1-..."
+#     models:
+#       - name: "anthropic/claude-sonnet-4"
+#         alias: "claude-sonnet"
+#   - name: "responses-service"
+#     protocol: "responses"
+#     base-url: "https://api.example.com/v1"
+#     api-key-entries:
+#       - api-key: "sk-..."
+#     models:
+#       - name: "reasoning-model"
+#         alias: "reasoning-model"
+
 # Vertex API keys (Vertex-compatible endpoints, base-url is optional)
 # vertex-api-key:
 #   - api-key: "vk-123..."                        # x-goog-api-key header

@@ -218,9 +218,17 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		}
 		openAICompatCount += len(entry.APIKeyEntries)
 	}
+	customProviderCount := 0
+	for i := range cfg.CustomProvider {
+		entry := cfg.CustomProvider[i]
+		if entry.Disabled {
+			continue
+		}
+		customProviderCount += len(entry.APIKeyEntries)
+	}
 
-	total := authEntries + geminiAPIKeyCount + interactionsAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + vertexAICompatCount + openAICompatCount
-	fmt.Printf("server clients and configuration updated: %d clients (%d auth entries + %d Gemini API keys + %d Interactions API keys + %d Claude API keys + %d Codex keys + %d xAI keys + %d Vertex-compat + %d OpenAI-compat)\n",
+	total := authEntries + geminiAPIKeyCount + interactionsAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + vertexAICompatCount + openAICompatCount + customProviderCount
+	fmt.Printf("server clients and configuration updated: %d clients (%d auth entries + %d Gemini API keys + %d Interactions API keys + %d Claude API keys + %d Codex keys + %d xAI keys + %d Vertex-compat + %d OpenAI-compat + %d custom-provider)\n",
 		total,
 		authEntries,
 		geminiAPIKeyCount,
@@ -230,6 +238,7 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		xaiAPIKeyCount,
 		vertexAICompatCount,
 		openAICompatCount,
+		customProviderCount,
 	)
 	return ctx.Err() == nil
 }

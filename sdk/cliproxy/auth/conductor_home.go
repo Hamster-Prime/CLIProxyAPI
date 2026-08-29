@@ -874,7 +874,7 @@ func (m *Manager) homeRuntimeAuthByID(sessionID string, authID string) (*Auth, P
 		return nil, nil, "", false
 	}
 	executor, ok := m.Executor(executorKey)
-	if !ok && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["base_url"]) != "" {
+	if !ok && !isConfiguredCustomProviderAuth(auth) && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["base_url"]) != "" {
 		executor, ok = m.Executor("openai-compatibility")
 	}
 	if !ok {
@@ -1114,7 +1114,7 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 	}
 
 	executor, okExecutor := m.Executor(executorKey)
-	if !okExecutor && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["base_url"]) != "" {
+	if !okExecutor && !isConfiguredCustomProviderAuth(&auth) && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["base_url"]) != "" {
 		executor, okExecutor = m.Executor("openai-compatibility")
 	}
 	if !okExecutor {

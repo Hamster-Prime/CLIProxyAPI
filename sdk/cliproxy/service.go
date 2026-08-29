@@ -36,10 +36,11 @@ type Service struct {
 	configUpdateMu sync.Mutex
 
 	// configRuntimeMu orders side-effecting runtime application after config commits.
-	configRuntimeMu        sync.Mutex
-	executorRegistrationMu sync.Mutex
-	configSequence         uint64
-	appliedRoutingState    *routingRuntimeState
+	configRuntimeMu            sync.Mutex
+	executorRegistrationMu     sync.Mutex
+	customProviderExecutorKeys map[string]struct{}
+	configSequence             uint64
+	appliedRoutingState        *routingRuntimeState
 
 	// configPath is the path to the configuration file.
 	configPath string

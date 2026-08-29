@@ -173,6 +173,34 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 	cfg.OpenAICompatibility = out
 }
 
+// SanitizeCustomProvider removes custom provider entries without a BaseURL and
+// normalizes fields used for routing. Protocol values are canonicalized while
+// unknown values are retained for validation to report to the caller.
+func (cfg *Config) SanitizeCustomProvider() {
+	if cfg == nil || len(cfg.CustomProvider) == 0 {
+		return
+	}
+	out := make([]CustomProvider, 0, len(cfg.CustomProvider))
+	for i := range cfg.CustomProvider {
+		e := cfg.CustomProvider[i]
+		e.Name = strings.TrimSpace(e.Name)
+		e.Prefix = normalizeModelPrefix(e.Prefix)
+		e.Protocol = NormalizeCustomProviderProtocol(e.Protocol)
+		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.Headers = NormalizeHeaders(e.Headers)
+		if e.BaseURL == "" {
+			continue
+		}
+		out = append(out, e)
+	}
+	cfg.CustomProvider = out
+}
+
+// SanitizeCustomProviders is the plural alias for SanitizeCustomProvider.
+func (cfg *Config) SanitizeCustomProviders() {
+	cfg.SanitizeCustomProvider()
+}
+
 // SanitizeCodexKeys removes Codex API key entries missing a BaseURL.
 // It trims whitespace and preserves order for remaining entries.
 func (cfg *Config) SanitizeCodexKeys() {

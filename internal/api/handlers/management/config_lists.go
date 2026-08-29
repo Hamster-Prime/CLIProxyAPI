@@ -915,6 +915,242 @@ func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 	c.JSON(400, gin.H{"error": "missing name or index"})
 }
 
+// custom-provider: []CustomProvider
+func (h *Handler) GetCustomProviders(c *gin.Context) {
+	c.JSON(200, gin.H{"custom-provider": h.customProvidersWithAuthIndex()})
+}
+
+// GetCustomProvider is the singular compatibility alias for GetCustomProviders.
+func (h *Handler) GetCustomProvider(c *gin.Context) {
+	h.GetCustomProviders(c)
+}
+
+func (h *Handler) PutCustomProviders(c *gin.Context) {
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	var arr []config.CustomProvider
+	if err = json.Unmarshal(data, &arr); err != nil {
+		var obj struct {
+			Items []config.CustomProvider `json:"items"`
+		}
+		var envelope map[string]json.RawMessage
+		if err2 := json.Unmarshal(data, &obj); err2 != nil || json.Unmarshal(data, &envelope) != nil {
+			c.JSON(400, gin.H{"error": "invalid body"})
+			return
+		}
+		if _, hasItems := envelope["items"]; !hasItems {
+			c.JSON(400, gin.H{"error": "invalid body"})
+			return
+		}
+		arr = obj.Items
+	}
+
+	filtered := make([]config.CustomProvider, 0, len(arr))
+	seenNames := make(map[string]int, len(arr))
+	for i := range arr {
+		normalizeCustomProviderEntry(&arr[i])
+		if errValidate := config.ValidateCustomProviderProtocol(arr[i].Protocol); errValidate != nil {
+			c.JSON(400, gin.H{"error": fmt.Sprintf("custom-provider[%d].protocol: %v", i, errValidate)})
+			return
+		}
+		if strings.TrimSpace(arr[i].Name) == "" {
+			c.JSON(400, gin.H{"error": fmt.Sprintf("custom-provider[%d].name is required", i)})
+			return
+		}
+		nameKey := strings.ToLower(strings.TrimSpace(arr[i].Name))
+		if previous, ok := seenNames[nameKey]; ok {
+			c.JSON(400, gin.H{"error": fmt.Sprintf("custom-provider[%d].name duplicates custom-provider[%d]", i, previous)})
+			return
+		}
+		seenNames[nameKey] = i
+		if strings.TrimSpace(arr[i].BaseURL) == "" {
+			continue
+		}
+		for keyIndex := range arr[i].APIKeyEntries {
+			field := fmt.Sprintf("custom-provider[%d].api-key-entries[%d].weight", i, keyIndex)
+			if rejectInvalidCredentialWeight(c, field, arr[i].APIKeyEntries[keyIndex].Weight) {
+				return
+			}
+		}
+		filtered = append(filtered, arr[i])
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg.CustomProvider = append([]config.CustomProvider(nil), filtered...)
+	h.cfg.SanitizeCustomProvider()
+	h.persistLocked(c)
+}
+
+// PutCustomProvider is the singular compatibility alias for PutCustomProviders.
+func (h *Handler) PutCustomProvider(c *gin.Context) {
+	h.PutCustomProviders(c)
+}
+
+func (h *Handler) PatchCustomProvider(c *gin.Context) {
+	type customProviderPatch struct {
+		Name                  *string                          `json:"name"`
+		Priority              *int                             `json:"priority"`
+		Prefix                *string                          `json:"prefix"`
+		Protocol              *string                          `json:"protocol"`
+		Disabled              *bool                            `json:"disabled"`
+		DisableCooling        json.RawMessage                  `json:"disable-cooling"`
+		BaseURL               *string                          `json:"base-url"`
+		APIKeyEntries         *[]config.CustomProviderAPIKey   `json:"api-key-entries"`
+		Models                *[]config.CustomProviderModel    `json:"models"`
+		Headers               *map[string]string               `json:"headers"`
+		SupportPromptCacheKey *bool                            `json:"support-prompt-cache-key"`
+		RequestRetry          *int                             `json:"request-retry"`
+		RequestScopedErrors   *[]config.RequestScopedErrorRule `json:"request-scoped-errors"`
+	}
+	var body struct {
+		Name  *string              `json:"name"`
+		Index *int                 `json:"index"`
+		Value *customProviderPatch `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	targetIndex := -1
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.CustomProvider) {
+		targetIndex = *body.Index
+	}
+	if targetIndex == -1 && body.Name != nil {
+		match := strings.TrimSpace(*body.Name)
+		for i := range h.cfg.CustomProvider {
+			if strings.EqualFold(strings.TrimSpace(h.cfg.CustomProvider[i].Name), match) {
+				targetIndex = i
+				break
+			}
+		}
+	}
+	if targetIndex == -1 {
+		c.JSON(404, gin.H{"error": "item not found"})
+		return
+	}
+
+	entry := h.cfg.CustomProvider[targetIndex]
+	if body.Value.Name != nil {
+		entry.Name = strings.TrimSpace(*body.Value.Name)
+	}
+	if body.Value.Priority != nil {
+		entry.Priority = *body.Value.Priority
+	}
+	if body.Value.Prefix != nil {
+		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
+	}
+	if body.Value.Protocol != nil {
+		entry.Protocol = *body.Value.Protocol
+	}
+	if body.Value.Disabled != nil {
+		entry.Disabled = *body.Value.Disabled
+	}
+	if !applyDisableCoolingPatch(c, body.Value.DisableCooling, &entry.DisableCooling) {
+		return
+	}
+	if body.Value.RequestRetry != nil {
+		entry.RequestRetry = body.Value.RequestRetry
+	}
+	if body.Value.BaseURL != nil {
+		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
+		if entry.BaseURL == "" {
+			h.cfg.CustomProvider = append(h.cfg.CustomProvider[:targetIndex], h.cfg.CustomProvider[targetIndex+1:]...)
+			h.cfg.SanitizeCustomProvider()
+			h.persistLocked(c)
+			return
+		}
+	}
+	if body.Value.APIKeyEntries != nil {
+		for keyIndex := range *body.Value.APIKeyEntries {
+			weight := (*body.Value.APIKeyEntries)[keyIndex].Weight
+			if rejectInvalidCredentialWeight(c, fmt.Sprintf("api-key-entries[%d].weight", keyIndex), weight) {
+				return
+			}
+		}
+		entry.APIKeyEntries = append([]config.CustomProviderAPIKey(nil), (*body.Value.APIKeyEntries)...)
+	}
+	if body.Value.Models != nil {
+		entry.Models = append([]config.CustomProviderModel(nil), (*body.Value.Models)...)
+	}
+	if body.Value.Headers != nil {
+		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
+	}
+	if body.Value.SupportPromptCacheKey != nil {
+		entry.SupportPromptCacheKey = *body.Value.SupportPromptCacheKey
+	}
+	if body.Value.RequestScopedErrors != nil {
+		entry.RequestScopedErrors = append([]config.RequestScopedErrorRule(nil), (*body.Value.RequestScopedErrors)...)
+	}
+
+	normalizeCustomProviderEntry(&entry)
+	if errValidate := config.ValidateCustomProviderProtocol(entry.Protocol); errValidate != nil {
+		c.JSON(400, gin.H{"error": fmt.Sprintf("protocol: %v", errValidate)})
+		return
+	}
+	if strings.TrimSpace(entry.Name) == "" {
+		c.JSON(400, gin.H{"error": "name is required"})
+		return
+	}
+	nameKey := strings.ToLower(strings.TrimSpace(entry.Name))
+	for i := range h.cfg.CustomProvider {
+		if i == targetIndex {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(h.cfg.CustomProvider[i].Name)) == nameKey {
+			c.JSON(400, gin.H{"error": "name duplicates another custom provider"})
+			return
+		}
+	}
+	for keyIndex := range entry.APIKeyEntries {
+		if rejectInvalidCredentialWeight(c, fmt.Sprintf("api-key-entries[%d].weight", keyIndex), entry.APIKeyEntries[keyIndex].Weight) {
+			return
+		}
+	}
+	h.cfg.CustomProvider[targetIndex] = entry
+	h.cfg.SanitizeCustomProvider()
+	h.persistLocked(c)
+}
+
+func (h *Handler) DeleteCustomProvider(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if name := strings.TrimSpace(c.Query("name")); name != "" {
+		matchIndex := -1
+		for i := range h.cfg.CustomProvider {
+			if strings.EqualFold(strings.TrimSpace(h.cfg.CustomProvider[i].Name), name) {
+				matchIndex = i
+				break
+			}
+		}
+		if matchIndex == -1 {
+			c.JSON(404, gin.H{"error": "item not found"})
+			return
+		}
+		h.cfg.CustomProvider = append(h.cfg.CustomProvider[:matchIndex], h.cfg.CustomProvider[matchIndex+1:]...)
+		h.cfg.SanitizeCustomProvider()
+		h.persistLocked(c)
+		return
+	}
+	if idxStr := c.Query("index"); idxStr != "" {
+		var idx int
+		_, err := fmt.Sscanf(idxStr, "%d", &idx)
+		if err == nil && idx >= 0 && idx < len(h.cfg.CustomProvider) {
+			h.cfg.CustomProvider = append(h.cfg.CustomProvider[:idx], h.cfg.CustomProvider[idx+1:]...)
+			h.cfg.SanitizeCustomProvider()
+			h.persistLocked(c)
+			return
+		}
+	}
+	c.JSON(400, gin.H{"error": "missing name or index"})
+}
+
 // vertex-api-key: []VertexCompatKey
 func (h *Handler) GetVertexCompatKeys(c *gin.Context) {
 	c.JSON(200, gin.H{"vertex-api-key": h.vertexCompatKeysWithAuthIndex()})
@@ -1817,6 +2053,40 @@ func normalizedOpenAICompatibilityEntries(entries []config.OpenAICompatibility) 
 			copyEntry.RequestScopedErrors = append([]config.RequestScopedErrorRule(nil), copyEntry.RequestScopedErrors...)
 		}
 		normalizeOpenAICompatibilityEntry(&copyEntry)
+		out[i] = copyEntry
+	}
+	return out
+}
+
+func normalizeCustomProviderEntry(entry *config.CustomProvider) {
+	if entry == nil {
+		return
+	}
+	entry.Name = strings.TrimSpace(entry.Name)
+	entry.Prefix = strings.TrimSpace(entry.Prefix)
+	entry.Protocol = config.NormalizeCustomProviderProtocol(entry.Protocol)
+	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
+	entry.Headers = config.NormalizeHeaders(entry.Headers)
+	for i := range entry.APIKeyEntries {
+		entry.APIKeyEntries[i].APIKey = strings.TrimSpace(entry.APIKeyEntries[i].APIKey)
+		entry.APIKeyEntries[i].ProxyURL = strings.TrimSpace(entry.APIKeyEntries[i].ProxyURL)
+	}
+}
+
+func normalizedCustomProviderEntries(entries []config.CustomProvider) []config.CustomProvider {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]config.CustomProvider, len(entries))
+	for i := range entries {
+		copyEntry := entries[i]
+		if len(copyEntry.APIKeyEntries) > 0 {
+			copyEntry.APIKeyEntries = append([]config.CustomProviderAPIKey(nil), copyEntry.APIKeyEntries...)
+		}
+		if len(copyEntry.RequestScopedErrors) > 0 {
+			copyEntry.RequestScopedErrors = append([]config.RequestScopedErrorRule(nil), copyEntry.RequestScopedErrors...)
+		}
+		normalizeCustomProviderEntry(&copyEntry)
 		out[i] = copyEntry
 	}
 	return out

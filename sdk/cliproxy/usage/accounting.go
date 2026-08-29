@@ -246,8 +246,15 @@ func EnsureTokenBreakdown(detail Detail) Detail {
 // direct SDK usage details using the known provider's token semantics. Unknown
 // providers remain unclassified instead of guessing how their buckets overlap.
 func EnsureTokenBreakdownForProvider(detail Detail, provider, executorType string) Detail {
+	return EnsureTokenBreakdownForProviderWithProtocol(detail, provider, executorType, "")
+}
+
+// EnsureTokenBreakdownForProviderWithProtocol attaches a valid v2 breakdown
+// using both the provider executor and its fixed upstream protocol. This is
+// needed for custom providers because their names are operator-defined.
+func EnsureTokenBreakdownForProviderWithProtocol(detail Detail, provider, executorType, protocol string) Detail {
 	if !detail.TokenBreakdown.Valid() {
-		semantics := tokenAccountingSemanticsFor(provider, executorType)
+		semantics := tokenAccountingSemanticsFor(provider, executorType, protocol)
 		if detail.CacheReadTokens == 0 && detail.CachedTokens > 0 && detail.InputTokens == 0 &&
 			detail.OutputTokens == 0 && detail.ReasoningTokens == 0 && detail.CacheCreationTokens == 0 && detail.TotalTokens == 0 &&
 			(semantics == tokenAccountingSemanticsSubset || semantics == tokenAccountingSemanticsSeparateReasoning) {
@@ -332,11 +339,20 @@ func unclassifiedTokenLowerBound(detail Detail) (int64, bool) {
 	return nonNegativeSum(inputTotal, outputTotal)
 }
 
-func tokenAccountingSemanticsFor(provider, executorType string) tokenAccountingSemantics {
+func tokenAccountingSemanticsFor(provider, executorType, protocol string) tokenAccountingSemantics {
 	normalizedProvider := strings.ToLower(strings.TrimSpace(provider))
 	normalizedExecutor := strings.ToLower(strings.TrimSpace(executorType))
 	value := strings.TrimSpace(normalizedProvider + " " + normalizedExecutor)
 	if value == "" || value == "unknown" || value == "unknown unknown" {
+		return tokenAccountingSemanticsUnknown
+	}
+	if strings.HasPrefix(normalizedProvider, "custom-provider:") || normalizedExecutor == "customproviderexecutor" {
+		switch strings.ToLower(strings.TrimSpace(protocol)) {
+		case "messages", "message", "anthropic", "anthropic-messages":
+			return tokenAccountingSemanticsIndependent
+		case "completions", "completion", "chat", "chat-completions", "responses", "response", "openai-responses", "openai-response", "":
+			return tokenAccountingSemanticsSubset
+		}
 		return tokenAccountingSemanticsUnknown
 	}
 	if normalizedExecutor == "openaicompatexecutor" || normalizedProvider == "openai-compatibility" || strings.HasPrefix(normalizedProvider, "openai-compatible-") {

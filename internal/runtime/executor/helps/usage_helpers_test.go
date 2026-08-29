@@ -740,6 +740,19 @@ func TestStreamUsageBufferPublishFailure(t *testing.T) {
 	}
 }
 
+func TestStreamUsageBufferObserveOpenAIResponseStream(t *testing.T) {
+	var buffer StreamUsageBuffer
+	buffer.ObserveOpenAIResponseStream([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}`))
+
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("expected Responses usage to be observed")
+	}
+	if detail.InputTokens != 10 || detail.OutputTokens != 4 || detail.TotalTokens != 14 {
+		t.Fatalf("detail = %+v, want input=10 output=4 total=14", detail)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

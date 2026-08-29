@@ -30,6 +30,15 @@ type VertexCompatModel = internalconfig.VertexCompatModel
 type OpenAICompatibility = internalconfig.OpenAICompatibility
 type OpenAICompatibilityAPIKey = internalconfig.OpenAICompatibilityAPIKey
 type OpenAICompatibilityModel = internalconfig.OpenAICompatibilityModel
+type CustomProvider = internalconfig.CustomProvider
+type CustomProviderAPIKey = internalconfig.CustomProviderAPIKey
+type CustomProviderModel = internalconfig.CustomProviderModel
+
+const (
+	CustomProviderProtocolCompletions = internalconfig.CustomProviderProtocolCompletions
+	CustomProviderProtocolResponses   = internalconfig.CustomProviderProtocolResponses
+	CustomProviderProtocolMessages    = internalconfig.CustomProviderProtocolMessages
+)
 
 type TLS = internalconfig.TLSConfig
 
@@ -44,6 +53,14 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 }
 
 func ParseConfigBytes(data []byte) (*Config, error) { return internalconfig.ParseConfigBytes(data) }
+
+func NormalizeCustomProviderProtocol(raw string) string {
+	return internalconfig.NormalizeCustomProviderProtocol(raw)
+}
+
+func ValidateCustomProviderProtocol(raw string) error {
+	return internalconfig.ValidateCustomProviderProtocol(raw)
+}
 
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	return internalconfig.SaveConfigPreserveComments(configFile, cfg)
