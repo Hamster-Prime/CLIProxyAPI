@@ -865,6 +865,104 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_NormalizesInputIma
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_InputImageURLShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		part string
+		want string
+	}{
+		{
+			name: "image_url string",
+			part: `{"type":"input_image","image_url":"https://example.com/string.png"}`,
+			want: "https://example.com/string.png",
+		},
+		{
+			name: "image_url object",
+			part: `{"type":"input_image","image_url":{"url":"https://example.com/object.png"}}`,
+			want: "https://example.com/object.png",
+		},
+		{
+			name: "top-level url fallback",
+			part: `{"type":"input_image","url":"https://example.com/fallback.png"}`,
+			want: "https://example.com/fallback.png",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := []byte(`{"input":[{"type":"message","role":"user","content":[` + tt.part + `]}]}`)
+			out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5.4", raw, false)
+			content := gjson.GetBytes(out, "messages.0.content")
+			if !content.IsArray() || len(content.Array()) != 1 {
+				t.Fatalf("expected one image content part, got %s; output=%s", content.Raw, out)
+			}
+			part := content.Get("0")
+			if got := part.Get("type").String(); got != "image_url" {
+				t.Fatalf("content type = %q, want image_url; output=%s", got, out)
+			}
+			if got := part.Get("image_url.url").String(); got != tt.want {
+				t.Fatalf("image URL = %q, want %q; output=%s", got, tt.want, out)
+			}
+		})
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_NormalizesCompatibilityInputShapes(t *testing.T) {
+	raw := []byte(`{
+		"input":[
+			{"type":"message","role":"user","content":{"type":"input_text","text":"object content"}},
+			{"type":"input_text","text":"direct text"},
+			{"type":"message","role":"user","content":[{"type":"text","text":"plain text part"}]},
+			"string item"
+		]
+	}`)
+	out := gjson.ParseBytes(ConvertOpenAIResponsesRequestToOpenAIChatCompletions("model", raw, false))
+	messages := out.Get("messages")
+	if !messages.IsArray() || len(messages.Array()) != 4 {
+		t.Fatalf("messages = %s, want four normalized messages", messages.Raw)
+	}
+	want := []string{"object content", "direct text", "plain text part", "string item"}
+	for index, expected := range want {
+		content := messages.Get(fmt.Sprintf("%d.content", index))
+		got := content.String()
+		if content.IsArray() {
+			got = content.Get("0.text").String()
+		}
+		if got != expected {
+			t.Fatalf("messages[%d].content = %q, want %q; output=%s", index, got, expected, out.Raw)
+		}
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletionsSkipsSemanticEmptyMessages(t *testing.T) {
+	raw := []byte(`{
+		"input":[
+			{"type":"message","content":["hello",{"type":"unsupported_part","value":"ignored"}]},
+			{"type":"message","role":"user","content":[]},
+			{"type":"input_text","text":""}
+		]
+	}`)
+	out := gjson.ParseBytes(ConvertOpenAIResponsesRequestToOpenAIChatCompletions("model", raw, false))
+	messages := out.Get("messages")
+	if got := len(messages.Array()); got != 1 {
+		t.Fatalf("message count = %d, want 1; output=%s", got, out.Raw)
+	}
+	if got := messages.Get("0.role").String(); got != "user" {
+		t.Fatalf("role = %q, want user", got)
+	}
+	if got := messages.Get("0.content.0.text").String(); got != "hello" {
+		t.Fatalf("content text = %q, want hello; output=%s", got, out.Raw)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletionsDefaultsUntypedMessageRole(t *testing.T) {
+	raw := []byte(`{"input":[{"content":"hello"}]}`)
+	out := gjson.ParseBytes(ConvertOpenAIResponsesRequestToOpenAIChatCompletions("model", raw, false))
+	if got := out.Get("messages.0.role").String(); got != "user" {
+		t.Fatalf("role = %q, want user; output=%s", got, out.Raw)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DeduplicatesToolsAcrossAdditionalTools(t *testing.T) {
 	raw := []byte(`{
 		"input": [

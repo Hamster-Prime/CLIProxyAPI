@@ -1,14 +1,32 @@
 package executor
 
 import (
+	"context"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/tidwall/gjson"
 )
+
+type customProviderRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f customProviderRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func customProviderJSONResponse(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
 
 func TestCustomProviderExecutorRequestToFormatAndEndpoint(t *testing.T) {
 	tests := []struct {
@@ -102,5 +120,223 @@ func TestCustomProviderExecutorRecognizesMessageErrors(t *testing.T) {
 	streamErr, ok := openAICompatStreamDataError([]byte(`{"type":"message_error","error":{"message":"bad"}}`), "message_error")
 	if !ok || streamErr.code != http.StatusBadGateway {
 		t.Fatalf("message_error payload = (%+v, %v), want bad gateway error", streamErr, ok)
+	}
+}
+
+func TestCustomProviderExecutorResponsesTranslatesChatRequest(t *testing.T) {
+	var gotPath string
+	var gotAuth string
+	var gotBody []byte
+	roundTripper := customProviderRoundTripper(func(req *http.Request) (*http.Response, error) {
+		gotPath = req.URL.Path
+		gotAuth = req.Header.Get("Authorization")
+		gotBody, _ = io.ReadAll(req.Body)
+		return customProviderJSONResponse(`{"id":"resp_1","object":"response","created_at":1700000000,"model":"upstream","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`), nil
+	})
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(roundTripper))
+	executor := NewCustomProviderExecutor("custom-provider:responses", config.CustomProviderProtocolResponses, &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": "https://gateway.example/v1",
+		"api_key":  "secret",
+	}}
+	payload := []byte(`{"model":"client-model","messages":[{"role":"user","content":"hello"}]}`)
+	resp, errExecute := executor.Execute(ctx, auth, cliproxyexecutor.Request{Model: "upstream", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAI,
+		ResponseFormat:  sdktranslator.FormatOpenAI,
+		OriginalRequest: payload,
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if gotPath != "/v1/responses" {
+		t.Fatalf("path = %q, want /v1/responses", gotPath)
+	}
+	if gotAuth != "Bearer secret" {
+		t.Fatalf("Authorization = %q, want Bearer secret", gotAuth)
+	}
+	if got := gjson.GetBytes(gotBody, "input.0.role").String(); got != "user" {
+		t.Fatalf("input role = %q, want user; body=%s", got, gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "input.0.content.0.text").String(); got != "hello" {
+		t.Fatalf("input text = %q, want hello; body=%s", got, gotBody)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "ok" {
+		t.Fatalf("response content = %q, want ok; body=%s", got, resp.Payload)
+	}
+}
+
+func TestCustomProviderExecutorResponsesPreservesNativeInput(t *testing.T) {
+	var gotBody []byte
+	roundTripper := customProviderRoundTripper(func(req *http.Request) (*http.Response, error) {
+		gotBody, _ = io.ReadAll(req.Body)
+		return customProviderJSONResponse(`{"id":"resp_2","object":"response","created_at":1700000001,"model":"upstream","status":"completed","output":[]}`), nil
+	})
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(roundTripper))
+	executor := NewCustomProviderExecutor("custom-provider:responses", config.CustomProviderProtocolResponses, &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": "https://gateway.example/v1",
+		"api_key":  "secret",
+	}}
+	payload := []byte(`{"model":"client-model","input":"hello"}`)
+	if _, errExecute := executor.Execute(ctx, auth, cliproxyexecutor.Request{Model: "upstream", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAIResponse,
+		ResponseFormat:  sdktranslator.FormatOpenAIResponse,
+		OriginalRequest: payload,
+	}); errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := gjson.GetBytes(gotBody, "input").String(); got != "hello" {
+		t.Fatalf("native input = %q, want hello; body=%s", got, gotBody)
+	}
+	if gjson.GetBytes(gotBody, "messages").Exists() {
+		t.Fatalf("native Responses body unexpectedly contains messages: %s", gotBody)
+	}
+}
+
+func TestCustomProviderExecutorResponsesNormalizesMessagesAtResponsesEndpoint(t *testing.T) {
+	var gotBody []byte
+	roundTripper := customProviderRoundTripper(func(req *http.Request) (*http.Response, error) {
+		gotBody, _ = io.ReadAll(req.Body)
+		return customProviderJSONResponse(`{"id":"resp_messages","object":"response","created_at":1700000001,"model":"upstream","status":"completed","output":[]}`), nil
+	})
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(roundTripper))
+	executor := NewCustomProviderExecutor("custom-provider:responses", config.CustomProviderProtocolResponses, &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": "https://gateway.example/v1",
+		"api_key":  "secret",
+	}}
+	payload := []byte(`{"model":"client-model","messages":[{"role":"user","content":"hello"}]}`)
+	if _, errExecute := executor.Execute(ctx, auth, cliproxyexecutor.Request{Model: "upstream", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAIResponse,
+		ResponseFormat:  sdktranslator.FormatOpenAIResponse,
+		OriginalRequest: payload,
+	}); errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := gjson.GetBytes(gotBody, "input.0.content.0.text").String(); got != "hello" {
+		t.Fatalf("normalized input text = %q; body=%s", got, gotBody)
+	}
+	if gjson.GetBytes(gotBody, "messages").Exists() {
+		t.Fatalf("normalized Responses body unexpectedly contains messages: %s", gotBody)
+	}
+}
+
+func TestCustomProviderExecutorResponsesRejectsEmptyTranslatedInput(t *testing.T) {
+	called := false
+	roundTripper := customProviderRoundTripper(func(req *http.Request) (*http.Response, error) {
+		called = true
+		return customProviderJSONResponse(`{}`), nil
+	})
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(roundTripper))
+	executor := NewCustomProviderExecutor("custom-provider:responses", config.CustomProviderProtocolResponses, &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": "https://gateway.example/v1",
+		"api_key":  "secret",
+	}}
+	if _, errExecute := executor.Execute(ctx, auth, cliproxyexecutor.Request{Model: "upstream", Payload: []byte(`{"model":"client-model","messages":[]}`)}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAI,
+		ResponseFormat: sdktranslator.FormatOpenAI,
+	}); errExecute == nil {
+		t.Fatal("Execute() should reject an empty Responses input")
+	}
+	if called {
+		t.Fatal("upstream should not be called for an empty Responses input")
+	}
+}
+
+func TestCustomProviderExecutorResponsesBridgesMessagesAlongsideInstructions(t *testing.T) {
+	root := gjson.ParseBytes(normalizeCustomResponsesRequest(
+		sdktranslator.FormatOpenAIResponse,
+		"model",
+		[]byte(`{"instructions":"keep this instruction","previous_response_id":"resp_prev","messages":[{"role":"user","content":"hello"}]}`),
+		false,
+	))
+	if got := root.Get("input.0.content.0.text").String(); got != "hello" {
+		t.Fatalf("bridged input text = %q, want hello; output=%s", got, root.Raw)
+	}
+	if got := root.Get("instructions").String(); got != "keep this instruction" {
+		t.Fatalf("instructions = %q, want preserved instruction; output=%s", got, root.Raw)
+	}
+	if got := root.Get("previous_response_id").String(); got != "resp_prev" {
+		t.Fatalf("previous_response_id = %q, want resp_prev; output=%s", got, root.Raw)
+	}
+}
+
+func TestCustomProviderExecutorResponsesRejectsSemanticEmptyInput(t *testing.T) {
+	if openAICompatResponsesRequestHasInput([]byte(`{"input":[{"type":"message","role":"user","content":[]}]}`)) {
+		t.Fatal("empty message should not count as usable Responses input")
+	}
+	if openAICompatResponsesRequestHasInput([]byte(`{"input":[{"type":"message","content":[{"type":"unsupported","value":""}]}]}`)) {
+		t.Fatal("unsupported empty content should not count as usable Responses input")
+	}
+}
+
+func TestCustomProviderExecutorCompletionsRejectsUnmappedResponsesInput(t *testing.T) {
+	called := false
+	roundTripper := customProviderRoundTripper(func(req *http.Request) (*http.Response, error) {
+		called = true
+		return customProviderJSONResponse(`{}`), nil
+	})
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(roundTripper))
+	executor := NewCustomProviderExecutor("custom-provider:completions", config.CustomProviderProtocolCompletions, &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": "https://gateway.example/v1",
+		"api_key":  "secret",
+	}}
+	payload := []byte(`{"model":"client-model","input":[{"type":"input_file","file_id":"file_1"}]}`)
+	if _, errExecute := executor.Execute(ctx, auth, cliproxyexecutor.Request{Model: "upstream", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+	}); errExecute == nil {
+		t.Fatal("Execute() should reject an unmapped Responses input")
+	}
+	if called {
+		t.Fatal("upstream should not be called for an unmapped Responses input")
+	}
+}
+
+func TestCustomProviderExecutorResponsesTranslatesEventOnlyStream(t *testing.T) {
+	roundTripper := customProviderRoundTripper(func(_ *http.Request) (*http.Response, error) {
+		body := "event: response.created\ndata: {\"response\":{\"id\":\"resp_stream\",\"model\":\"upstream\",\"created_at\":1700000000}}\n\n" +
+			"event: response.output_text.delta\ndata: {\"delta\":\"hello\"}\n\n" +
+			"event: response.completed\ndata: {\"response\":{\"id\":\"resp_stream\",\"model\":\"upstream\",\"created_at\":1700000000,\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"
+		response := customProviderJSONResponse(body)
+		response.Header.Set("Content-Type", "text/event-stream")
+		return response, nil
+	})
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(roundTripper))
+	executor := NewCustomProviderExecutor("custom-provider:responses", config.CustomProviderProtocolResponses, &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": "https://gateway.example/v1",
+		"api_key":  "secret",
+	}}
+	payload := []byte(`{"model":"client-model","messages":[{"role":"user","content":"hello"}],"stream":true}`)
+	result, errExecute := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "upstream", Payload: payload}, cliproxyexecutor.Options{
+		Stream:          true,
+		SourceFormat:    sdktranslator.FormatOpenAI,
+		ResponseFormat:  sdktranslator.FormatOpenAI,
+		OriginalRequest: payload,
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	var chunks [][]byte
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		chunks = append(chunks, chunk.Payload)
+	}
+	if len(chunks) != 3 {
+		t.Fatalf("stream chunks = %d, want 3", len(chunks))
+	}
+	if got := gjson.GetBytes(chunks[1], "choices.0.delta.content").String(); got != "hello" {
+		t.Fatalf("content delta = %q, want hello; chunk=%s", got, chunks[1])
+	}
+	if got := gjson.GetBytes(chunks[2], "choices.0.finish_reason").String(); got != "stop" {
+		t.Fatalf("finish reason = %q, want stop; chunk=%s", got, chunks[2])
+	}
+	if got := gjson.GetBytes(chunks[2], "usage.total_tokens").Int(); got != 3 {
+		t.Fatalf("total tokens = %d, want 3; chunk=%s", got, chunks[2])
 	}
 }

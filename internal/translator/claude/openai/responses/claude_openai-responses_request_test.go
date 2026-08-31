@@ -42,6 +42,42 @@ func TestConvertOpenAIResponsesRequestToClaude_SanitizesToolCallIDsForClaude(t *
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToClaudeAcceptsDirectInputParts(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{"type":"input_text","text":"describe this"},
+			{"type":"input_image","image_url":{"url":"https://example.com/image.png"}}
+		]
+	}`)
+	out := gjson.ParseBytes(ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false))
+	messages := out.Get("messages")
+	if !messages.IsArray() || len(messages.Array()) != 1 {
+		t.Fatalf("messages = %s, want one user message", messages.Raw)
+	}
+	if got := messages.Get("0.role").String(); got != "user" {
+		t.Fatalf("role = %q, want user", got)
+	}
+	if got := messages.Get("0.content.0.text").String(); got != "describe this" {
+		t.Fatalf("text = %q, want describe this", got)
+	}
+	if got := messages.Get("0.content.1.type").String(); got != "image" {
+		t.Fatalf("image type = %q, want image", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaudeSkipsEmptyMessage(t *testing.T) {
+	raw := []byte(`{"model":"claude-test","input":[{"type":"message","role":"user","content":[]},{"type":"message","role":"user","content":"hello"}]}`)
+	out := gjson.ParseBytes(ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false))
+	messages := out.Get("messages")
+	if got := len(messages.Array()); got != 1 {
+		t.Fatalf("message count = %d, want 1; output=%s", got, out.Raw)
+	}
+	if got := messages.Get("0.content").String(); got != "hello" {
+		t.Fatalf("content = %q, want hello", got)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToClaude_ReasoningItemToThinkingBlock(t *testing.T) {
 	rawSignature, expectedSignature := testClaudeResponsesThinkingSignature(t)
 	raw := []byte(`{
@@ -512,6 +548,51 @@ func TestConvertOpenAIResponsesRequestToClaude_FunctionCallOutputPreservesInputI
 	}
 	if strings.Contains(toolResult.Get("content").Raw, "data:image") {
 		t.Fatalf("tool_result content must not embed data URL as text. Output: %s", string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_InputImageURLShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		part string
+		want string
+	}{
+		{
+			name: "image_url string",
+			part: `{"type":"input_image","image_url":"https://example.com/string.png"}`,
+			want: "https://example.com/string.png",
+		},
+		{
+			name: "image_url object",
+			part: `{"type":"input_image","image_url":{"url":"https://example.com/object.png"}}`,
+			want: "https://example.com/object.png",
+		},
+		{
+			name: "top-level url fallback",
+			part: `{"type":"input_image","url":"https://example.com/fallback.png"}`,
+			want: "https://example.com/fallback.png",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := []byte(`{"input":[{"type":"message","role":"user","content":[` + tt.part + `]}]}`)
+			out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+			content := gjson.GetBytes(out, "messages.0.content")
+			if !content.IsArray() || len(content.Array()) != 1 {
+				t.Fatalf("expected one image content part, got %s; output=%s", content.Raw, out)
+			}
+			part := content.Get("0")
+			if got := part.Get("type").String(); got != "image" {
+				t.Fatalf("content type = %q, want image; output=%s", got, out)
+			}
+			if got := part.Get("source.type").String(); got != "url" {
+				t.Fatalf("image source type = %q, want url; output=%s", got, out)
+			}
+			if got := part.Get("source.url").String(); got != tt.want {
+				t.Fatalf("image URL = %q, want %q; output=%s", got, tt.want, out)
+			}
+		})
 	}
 }
 

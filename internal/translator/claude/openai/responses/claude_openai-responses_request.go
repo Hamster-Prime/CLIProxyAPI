@@ -248,22 +248,45 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			if isResponsesSystemLevelRole(item.Get("role").String()) {
 				return true
 			}
-			typ := item.Get("type").String()
+			typ := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
+			if typ == "" && item.Type == gjson.String {
+				// The Responses API also accepts primitive strings in the input
+				// array. Treat them as user text instead of dropping them.
+				typ = "input_text"
+			}
 			if typ == "" && item.Get("role").String() != "" {
 				typ = "message"
 			}
 			switch typ {
 			case "message":
 				// Determine role and construct Claude-compatible content parts.
-				var role string
+				role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+				if role != "user" && role != "assistant" {
+					role = ""
+				}
 				var partsJSON [][]byte
 				if parts := item.Get("content"); parts.Exists() && parts.IsArray() {
 					parts.ForEach(func(_, part gjson.Result) bool {
-						ptype := part.Get("type").String()
+						ptype := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
+						if ptype == "" && part.Type == gjson.String {
+							ptype = "input_text"
+						}
+						if ptype == "" {
+							switch {
+							case part.Get("text").Exists():
+								ptype = "input_text"
+							case part.Get("image_url").Exists() || part.Get("url").Exists():
+								ptype = "input_image"
+							}
+						}
 						switch ptype {
-						case "input_text", "output_text":
-							if t := part.Get("text"); t.Exists() {
-								txt := t.String()
+						case "input_text", "output_text", "text":
+							textValue := part.Get("text")
+							if part.Type == gjson.String {
+								textValue = part
+							}
+							if textValue.Type == gjson.String && strings.TrimSpace(textValue.String()) != "" {
+								txt := textValue.String()
 								contentPart := []byte(`{"type":"text","text":""}`)
 								contentPart, _ = sjson.SetBytes(contentPart, "text", txt)
 								contentPart = attachClaudeCitations(contentPart, part.Get("annotations"))
@@ -272,8 +295,10 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 							}
 							if ptype == "input_text" {
 								role = "user"
-							} else {
+							} else if ptype == "output_text" {
 								role = "assistant"
+							} else if role == "" {
+								role = "user"
 							}
 						case "refusal":
 							// Claude has no refusal block; the text keeps the turn intact.
@@ -284,11 +309,8 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 								partsJSON = append(partsJSON, contentPart)
 							}
 							role = "assistant"
-						case "input_image":
-							url := part.Get("image_url").String()
-							if url == "" {
-								url = part.Get("url").String()
-							}
+						case "input_image", "image_url", "image":
+							url := responsesImageURL(part)
 							if url != "" {
 								var contentPart []byte
 								if strings.HasPrefix(url, "data:") {
@@ -346,7 +368,18 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 						}
 						return true
 					})
-				} else if parts.Type == gjson.String && parts.String() != "" {
+				} else if parts.IsObject() {
+					if contentPart := convertResponsesContentPartToClaude(parts); len(contentPart) > 0 {
+						contentPart = common.AttachCacheControl(contentPart, parts)
+						partsJSON = append(partsJSON, contentPart)
+						ptype := strings.ToLower(strings.TrimSpace(parts.Get("type").String()))
+						if ptype == "output_text" {
+							role = "assistant"
+						} else if role == "" {
+							role = "user"
+						}
+					}
+				} else if parts.Type == gjson.String && strings.TrimSpace(parts.String()) != "" {
 					contentPart := []byte(`{"type":"text","text":""}`)
 					contentPart, _ = sjson.SetBytes(contentPart, "text", parts.String())
 					partsJSON = append(partsJSON, contentPart)
@@ -369,6 +402,22 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 						partsJSON[lastIdx] = common.AttachCacheControl(partsJSON[lastIdx], item)
 					}
 					appendParts(role, partsJSON...)
+				}
+
+			case "input_text", "output_text", "text":
+				if contentPart := convertResponsesContentPartToClaude(item); len(contentPart) > 0 {
+					role := "user"
+					if typ == "output_text" {
+						role = "assistant"
+					}
+					contentPart = common.AttachCacheControl(contentPart, item)
+					appendParts(role, contentPart)
+				}
+
+			case "input_image", "image_url", "image":
+				if contentPart := convertResponsesContentPartToClaude(item); len(contentPart) > 0 {
+					contentPart = common.AttachCacheControl(contentPart, item)
+					appendParts("user", contentPart)
 				}
 
 			case "web_search_call":
@@ -448,6 +497,11 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			}
 			return true
 		})
+	} else if input.Type == gjson.String && strings.TrimSpace(input.String()) != "" {
+		contentPart := convertResponsesContentPartToClaude(input)
+		if len(contentPart) > 0 {
+			appendParts("user", contentPart)
+		}
 	}
 	flushPendingMessage()
 	hadMessages := len(messageBlocks) > 0
@@ -701,19 +755,38 @@ func applyResponsesToolResultContent(toolResult []byte, output gjson.Result) []b
 }
 
 func convertResponsesContentPartToClaude(part gjson.Result) []byte {
-	ptype := part.Get("type").String()
+	if part.Type == gjson.String {
+		if strings.TrimSpace(part.String()) == "" {
+			return nil
+		}
+		contentPart := []byte(`{"type":"text","text":""}`)
+		contentPart, _ = sjson.SetBytes(contentPart, "text", part.String())
+		return contentPart
+	}
+	ptype := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
+	if ptype == "" {
+		switch {
+		case part.Get("text").Exists():
+			ptype = "input_text"
+		case part.Get("image_url").Exists() || part.Get("url").Exists():
+			ptype = "input_image"
+		}
+	}
 	switch ptype {
-	case "input_text", "output_text":
-		if t := part.Get("text"); t.Exists() {
+	case "input_text", "output_text", "text":
+		if t := part.Get("text"); t.Type == gjson.String && strings.TrimSpace(t.String()) != "" {
 			contentPart := []byte(`{"type":"text","text":""}`)
 			contentPart, _ = sjson.SetBytes(contentPart, "text", t.String())
 			return contentPart
 		}
-	case "input_image":
-		url := part.Get("image_url").String()
-		if url == "" {
-			url = part.Get("url").String()
+	case "refusal":
+		if t := firstNonEmptyClaudeResponsesString(part.Get("refusal").String(), part.Get("text").String()); t != "" {
+			contentPart := []byte(`{"type":"text","text":""}`)
+			contentPart, _ = sjson.SetBytes(contentPart, "text", t)
+			return contentPart
 		}
+	case "input_image", "image_url", "image":
+		url := responsesImageURL(part)
 		if url == "" {
 			return nil
 		}
@@ -762,6 +835,31 @@ func convertResponsesContentPartToClaude(part gjson.Result) []byte {
 		return contentPart
 	}
 	return nil
+}
+
+func firstNonEmptyClaudeResponsesString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// responsesImageURL accepts both the Responses API string form and the
+// OpenAI-compatible object form used by some clients. A top-level url is kept
+// as a final fallback for older tool payloads.
+func responsesImageURL(item gjson.Result) string {
+	for _, path := range []string{"image_url", "image_url.url", "url"} {
+		value := item.Get(path)
+		if value.Type != gjson.String {
+			continue
+		}
+		if imageURL := strings.TrimSpace(value.String()); imageURL != "" {
+			return imageURL
+		}
+	}
+	return ""
 }
 
 func isOpenAIResponsesApplyPatchCustomTool(toolType string, tool gjson.Result) bool {

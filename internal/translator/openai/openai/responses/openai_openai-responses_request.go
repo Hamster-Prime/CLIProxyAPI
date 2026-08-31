@@ -58,7 +58,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	// Convert instructions to system message
-	if instructions := root.Get("instructions"); instructions.Exists() {
+	if instructions := root.Get("instructions"); instructions.Type == gjson.String && strings.TrimSpace(instructions.String()) != "" {
 		systemMessage := []byte(`{"role":"system","content":""}`)
 		systemMessage, _ = sjson.SetBytes(systemMessage, "content", instructions.String())
 		appendMessage(systemMessage)
@@ -69,7 +69,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		inputItems := input.Array()
 		outputCallIDs := make(map[string]struct{})
 		for _, item := range inputItems {
-			itemType := item.Get("type").String()
+			itemType := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
 			if itemType != "function_call_output" && itemType != "custom_tool_call_output" {
 				continue
 			}
@@ -164,9 +164,22 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		}
 
 		for _, item := range inputItems {
-			itemType := item.Get("type").String()
+			itemType := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
 			if itemType == "" && item.Get("role").String() != "" {
 				itemType = "message"
+			}
+			// A few Responses clients use a compact array form such as
+			// [{"type":"input_text","text":"hello"}] instead of wrapping
+			// the part in a message object. Treat those items as user/assistant
+			// turns rather than silently dropping them.
+			if itemType == "" && item.Type == gjson.String {
+				if strings.TrimSpace(item.String()) == "" {
+					continue
+				}
+				message := []byte(`{"role":"user","content":""}`)
+				message, _ = sjson.SetBytes(message, "content", item.String())
+				appendRegularMessage(message)
+				continue
 			}
 			if itemType != "function_call" && itemType != "custom_tool_call" {
 				flushPendingToolCalls()
@@ -175,7 +188,10 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			switch itemType {
 			case "message", "":
 				// Handle regular message conversion
-				role := item.Get("role").String()
+				role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+				if role == "" {
+					role = "user"
+				}
 				if role == "developer" {
 					role = "user"
 				}
@@ -186,41 +202,49 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				message := []byte(`{"role":"","content":[]}`)
 				message, _ = sjson.SetBytes(message, "role", role)
 
-				if content := item.Get("content"); content.Exists() && content.IsArray() {
+				hasContent := false
+				content := item.Get("content")
+				if content.Exists() && content.IsArray() {
 					var contentItems [][]byte
 					content.ForEach(func(_, contentItem gjson.Result) bool {
-						contentType := contentItem.Get("type").String()
-						if contentType == "" {
-							contentType = "input_text"
-						}
-
-						switch contentType {
-						case "input_text", "output_text":
-							text := contentItem.Get("text").String()
-							contentPart := []byte(`{"type":"text","text":""}`)
-							contentPart, _ = sjson.SetBytes(contentPart, "text", text)
-							contentItems = append(contentItems, contentPart)
-						case "input_image":
-							imageURL := contentItem.Get("image_url").String()
-							contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
-							contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", imageURL)
-							if detail, ok := normalizeChatImageDetail(contentItem.Get("detail")); ok && detail != "" {
-								contentPart, _ = sjson.SetBytes(contentPart, "image_url.detail", detail)
-							}
+						if contentPart := responsesContentPartToChat(contentItem); len(contentPart) > 0 {
 							contentItems = append(contentItems, contentPart)
 						}
 						return true
 					})
-					message = translatorcommon.SetRawArrayItems(message, "content", contentItems)
-				} else if content.Type == gjson.String {
+					if len(contentItems) > 0 {
+						message = translatorcommon.SetRawArrayItems(message, "content", contentItems)
+						hasContent = true
+					}
+				} else if content.IsObject() {
+					// Some gateways collapse a one-element content array into an
+					// object. Normalize it before the request reaches a Chat-only
+					// upstream, otherwise it is seen as an empty message.
+					if contentPart := responsesContentPartToChat(content); len(contentPart) > 0 {
+						message = translatorcommon.SetRawArrayItems(message, "content", [][]byte{contentPart})
+						hasContent = true
+					}
+				} else if content.Type == gjson.String && strings.TrimSpace(content.String()) != "" {
 					message, _ = sjson.SetBytes(message, "content", content.String())
+					hasContent = true
+				} else if text := item.Get("text"); text.Type == gjson.String && strings.TrimSpace(text.String()) != "" {
+					message, _ = sjson.SetBytes(message, "content", text.String())
+					hasContent = true
 				}
 
 				if role == "assistant" {
 					reasoningContent := combineOpenAIResponsesReasoning(takePendingReasoningContent(), item.Get("reasoning_content").String())
 					if reasoningContent != "" {
 						message, _ = sjson.SetBytes(message, "reasoning_content", reasoningContent)
+						hasContent = true
 					}
+				}
+				if toolCalls := item.Get("tool_calls"); toolCalls.IsArray() && len(toolCalls.Array()) > 0 {
+					message, _ = sjson.SetRawBytes(message, "tool_calls", []byte(toolCalls.Raw))
+					hasContent = true
+				}
+				if !hasContent {
+					continue
 				}
 
 				messageIndex := appendRegularMessage(message)
@@ -232,9 +256,35 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				reasoningContent := collectOpenAIResponsesReasoningContent(item)
 				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, reasoningContent)
 
+			case "input_text", "output_text", "text":
+				// Accept direct content parts in the input array. They are not
+				// emitted by the official SDK, but are common in compatibility
+				// gateways and older client implementations.
+				role := "user"
+				if itemType == "output_text" {
+					role = "assistant"
+				}
+				if strings.TrimSpace(item.Get("text").String()) == "" {
+					continue
+				}
+				message := []byte(`{"role":"","content":""}`)
+				message, _ = sjson.SetBytes(message, "role", role)
+				message, _ = sjson.SetBytes(message, "content", item.Get("text").String())
+				appendRegularMessage(message)
+
+			case "input_image", "image_url", "image":
+				if contentPart := responsesContentPartToChat(item); len(contentPart) > 0 {
+					message := []byte(`{"role":"user","content":[]}`)
+					message = translatorcommon.SetRawArrayItems(message, "content", [][]byte{contentPart})
+					appendRegularMessage(message)
+				}
+
 			case "function_call":
 				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, item.Get("reasoning_content").String())
 				// Buffer consecutive function calls and emit them as one assistant message.
+				if strings.TrimSpace(item.Get("name").String()) == "" {
+					continue
+				}
 				toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 
 				if callId := item.Get("call_id"); callId.Exists() {
@@ -260,6 +310,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			case "function_call_output":
 				mergeableAssistantIndex = -1
 				// Handle function call output conversion to tool message
+				if strings.TrimSpace(item.Get("call_id").String()) == "" {
+					continue
+				}
 				toolMessage := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
 				callID := ""
 
@@ -285,6 +338,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				// Codex freeform tool call replay: wrap the raw input so it
 				// matches the {"input": string} function shape used when
 				// converting custom tool definitions.
+				if strings.TrimSpace(item.Get("name").String()) == "" {
+					continue
+				}
 				toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 				toolCall, _ = sjson.SetBytes(toolCall, "id", item.Get("call_id").String())
 				toolCall, _ = sjson.SetBytes(toolCall, "function.name", item.Get("name").String())
@@ -297,6 +353,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 			case "custom_tool_call_output":
 				mergeableAssistantIndex = -1
+				if strings.TrimSpace(item.Get("call_id").String()) == "" {
+					continue
+				}
 				toolMessage := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
 				callID := strings.TrimSpace(item.Get("call_id").String())
 				toolMessage, _ = sjson.SetBytes(toolMessage, "tool_call_id", callID)
@@ -319,7 +378,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		flushPendingToolCalls()
 		appendPendingReasoningMessage()
 		flushDeferredMessages()
-	} else if input.Type == gjson.String {
+	} else if input.Type == gjson.String && strings.TrimSpace(input.String()) != "" {
 		msg := []byte(`{}`)
 		msg, _ = sjson.SetBytes(msg, "role", "user")
 		msg, _ = sjson.SetBytes(msg, "content", input.String())
@@ -466,23 +525,20 @@ func hasChatToolOutputImagePart(content gjson.Result) bool {
 }
 
 func chatToolOutputImageFields(item gjson.Result) (imageURL, detail string, ok bool) {
-	var imageURLValue gjson.Result
 	var detailValue gjson.Result
 	switch item.Get("type").String() {
 	case "image_url":
-		imageURLValue = item.Get("image_url.url")
 		detailValue = item.Get("image_url.detail")
+		if !detailValue.Exists() {
+			detailValue = item.Get("detail")
+		}
 	case "input_image":
-		imageURLValue = item.Get("image_url")
 		detailValue = item.Get("detail")
 	default:
 		return "", "", false
 	}
 
-	if imageURLValue.Type != gjson.String {
-		return "", "", false
-	}
-	imageURL = strings.TrimSpace(imageURLValue.String())
+	imageURL = responsesImageURL(item)
 	if imageURL == "" {
 		return "", "", false
 	}
@@ -492,6 +548,78 @@ func chatToolOutputImageFields(item gjson.Result) (imageURL, detail string, ok b
 		return "", "", false
 	}
 	return imageURL, detail, true
+}
+
+// responsesImageURL accepts both the Responses API string form and the
+// OpenAI-compatible object form used by some clients. A top-level url is kept
+// as a final fallback for older tool payloads.
+func responsesImageURL(item gjson.Result) string {
+	for _, path := range []string{"image_url", "image_url.url", "url"} {
+		value := item.Get(path)
+		if value.Type != gjson.String {
+			continue
+		}
+		if imageURL := strings.TrimSpace(value.String()); imageURL != "" {
+			return imageURL
+		}
+	}
+	return ""
+}
+
+// responsesContentPartToChat converts one Responses content part to the
+// corresponding Chat Completions content part. Keeping this in one helper is
+// important because clients use both array and object content representations.
+func responsesContentPartToChat(content gjson.Result) []byte {
+	if content.Type == gjson.String {
+		if strings.TrimSpace(content.String()) == "" {
+			return nil
+		}
+		part := []byte(`{"type":"text","text":""}`)
+		part, _ = sjson.SetBytes(part, "text", content.String())
+		return part
+	}
+	typ := strings.ToLower(strings.TrimSpace(content.Get("type").String()))
+	if typ == "" {
+		if content.Get("text").Exists() {
+			typ = "input_text"
+		} else if content.Get("image_url").Exists() || content.Get("url").Exists() {
+			typ = "input_image"
+		}
+	}
+	switch typ {
+	case "input_text", "output_text", "text":
+		if content.Get("text").Type != gjson.String || strings.TrimSpace(content.Get("text").String()) == "" {
+			return nil
+		}
+		part := []byte(`{"type":"text","text":""}`)
+		part, _ = sjson.SetBytes(part, "text", content.Get("text").String())
+		return part
+	case "refusal":
+		text := firstNonEmptyString(content.Get("refusal").String(), content.Get("text").String())
+		if text == "" {
+			return nil
+		}
+		part := []byte(`{"type":"text","text":""}`)
+		part, _ = sjson.SetBytes(part, "text", text)
+		return part
+	case "input_image", "image_url", "image":
+		imageURL := responsesImageURL(content)
+		if imageURL == "" {
+			return nil
+		}
+		part := []byte(`{"type":"image_url","image_url":{"url":""}}`)
+		part, _ = sjson.SetBytes(part, "image_url.url", imageURL)
+		detailValue := content.Get("detail")
+		if !detailValue.Exists() {
+			detailValue = content.Get("image_url.detail")
+		}
+		if detail, ok := normalizeChatImageDetail(detailValue); ok && detail != "" {
+			part, _ = sjson.SetBytes(part, "image_url.detail", detail)
+		}
+		return part
+	default:
+		return nil
+	}
 }
 
 func normalizeChatImageDetail(detailValue gjson.Result) (string, bool) {

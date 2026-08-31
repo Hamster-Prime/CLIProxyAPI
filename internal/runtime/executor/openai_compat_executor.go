@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	openairesponses "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -220,6 +221,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	isCompat := helps.APIKeyModelIsCompat(req)
 	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, opts.Stream, isCompat)
 	translated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, opts.Stream, isCompat)
+	if e.custom && to == sdktranslator.FormatOpenAIResponse {
+		originalTranslated = normalizeCustomResponsesRequest(from, baseModel, originalTranslated, opts.Stream)
+		translated = normalizeCustomResponsesRequest(from, baseModel, translated, opts.Stream)
+	}
 
 	translated, err = helps.ApplyRequestThinking(translated, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -243,6 +248,14 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 			translated = updated
 		}
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
+	}
+	if e.custom && to == sdktranslator.FormatOpenAIResponse && !openAICompatResponsesRequestHasInput(translated) {
+		err = statusErr{code: http.StatusBadRequest, msg: "custom responses provider request must include non-empty input, instructions, or previous_response_id"}
+		return resp, err
+	}
+	if e.custom && to == sdktranslator.FormatOpenAI && !openAICompatChatRequestHasInput(translated) {
+		err = statusErr{code: http.StatusBadRequest, msg: "custom completions provider request must include non-empty messages"}
+		return resp, err
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
@@ -317,6 +330,13 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 	if to == sdktranslator.FormatClaude {
 		reporter.Publish(ctx, helps.ParseClaudeUsage(body))
+	} else if to == sdktranslator.FormatOpenAIResponse {
+		if detail, ok := helps.ParseCodexUsage(body); ok {
+			reporter.Publish(ctx, detail)
+		} else {
+			// Some Responses-compatible gateways return usage at the top level.
+			reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
+		}
 	} else {
 		reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
 	}
@@ -464,6 +484,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	isCompat := helps.APIKeyModelIsCompat(req)
 	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, true, isCompat)
 	translated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, true, isCompat)
+	if e.custom && to == sdktranslator.FormatOpenAIResponse {
+		originalTranslated = normalizeCustomResponsesRequest(from, baseModel, originalTranslated, true)
+		translated = normalizeCustomResponsesRequest(from, baseModel, translated, true)
+	}
 
 	translated, err = helps.ApplyRequestThinking(translated, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -481,6 +505,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		if err != nil {
 			return nil, err
 		}
+	}
+	if e.custom && to == sdktranslator.FormatOpenAIResponse && !openAICompatResponsesRequestHasInput(translated) {
+		return nil, statusErr{code: http.StatusBadRequest, msg: "custom responses provider request must include non-empty input, instructions, or previous_response_id"}
+	}
+	if e.custom && to == sdktranslator.FormatOpenAI && !openAICompatChatRequestHasInput(translated) {
+		return nil, statusErr{code: http.StatusBadRequest, msg: "custom completions provider request must include non-empty messages"}
 	}
 
 	// Request usage data in the final streaming chunk only for Chat Completions.
@@ -627,12 +657,21 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 					return true
 				}
 			}
+			// A few Responses-compatible gateways put the event type only in the
+			// SSE `event:` field and omit it from the JSON data object. Native
+			// passthrough still uses frameBytes below; translated streams need the
+			// type in the payload so the schema converter can dispatch the event.
+			if e.custom && eventName != "" && gjson.GetBytes(dataPayload, "type").String() == "" {
+				if normalized, errSet := sjson.SetBytes(dataPayload, "type", eventName); errSet == nil {
+					dataPayload = normalized
+				}
+			}
 			if e.custom {
 				payloadType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(dataPayload, "type").String()))
 				switch {
-				case to == sdktranslator.FormatOpenAIResponse && (payloadType == "response.completed" || payloadType == "response.incomplete" || payloadType == "response.failed"):
+				case to == sdktranslator.FormatOpenAIResponse && (payloadType == "response.completed" || payloadType == "response.incomplete" || payloadType == "response.failed" || payloadType == "response.done" || strings.EqualFold(eventName, "response.completed") || strings.EqualFold(eventName, "response.incomplete") || strings.EqualFold(eventName, "response.failed") || strings.EqualFold(eventName, "response.done")):
 					isDone = true
-				case to == sdktranslator.FormatClaude && (payloadType == "message_stop" || payloadType == "message_error"):
+				case to == sdktranslator.FormatClaude && (payloadType == "message_stop" || payloadType == "message_error" || strings.EqualFold(eventName, "message_stop") || strings.EqualFold(eventName, "message_error")):
 					isDone = true
 				}
 			}
@@ -880,6 +919,9 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	}
 	isCompat := helps.APIKeyModelIsCompat(req)
 	translated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, false, isCompat)
+	if e != nil && e.custom && to == sdktranslator.FormatOpenAIResponse {
+		translated = normalizeCustomResponsesRequest(from, baseModel, translated, false)
+	}
 
 	modelForCounting := baseModel
 
@@ -899,7 +941,14 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 		if errTokenizer != nil {
 			return cliproxyexecutor.Response{}, fmt.Errorf("openai compat executor: tokenizer init failed: %w", errTokenizer)
 		}
-		count, err = helps.CountOpenAIChatTokens(enc, translated)
+		countPayload := translated
+		if to == sdktranslator.FormatOpenAIResponse {
+			// The OpenAI tokenizer helper understands Chat Completions fields.
+			// Normalize Responses input through the same bridge used for a
+			// Chat-compatible upstream so arrays and multimodal parts are counted.
+			countPayload = openairesponses.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(baseModel, translated, false)
+		}
+		count, err = helps.CountOpenAIChatTokens(enc, countPayload)
 		if err != nil {
 			return cliproxyexecutor.Response{}, fmt.Errorf("openai compat executor: token counting failed: %w", err)
 		}
@@ -1233,6 +1282,74 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 
 func openAICompatErrorEvent(eventName string) bool {
 	return strings.EqualFold(eventName, "error") || strings.EqualFold(eventName, "response.error") || strings.EqualFold(eventName, "response.failed") || strings.EqualFold(eventName, "message_error")
+}
+
+func openAICompatResponsesRequestHasInput(payload []byte) bool {
+	return openairesponses.HasUsableOpenAIResponsesInput(payload)
+}
+
+func openAICompatChatRequestHasInput(payload []byte) bool {
+	if !json.Valid(payload) {
+		return false
+	}
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() || len(messages.Array()) == 0 {
+		return false
+	}
+	probe := []byte(`{}`)
+	updated, errSet := sjson.SetRawBytes(probe, "input", []byte(messages.Raw))
+	if errSet != nil {
+		return false
+	}
+	return openairesponses.HasUsableOpenAIResponsesInput(updated)
+}
+
+func normalizeCustomResponsesRequest(from sdktranslator.Format, model string, payload []byte, stream bool) []byte {
+	if from == sdktranslator.FormatOpenAIResponse {
+		payload = openairesponses.NormalizeOpenAIResponsesRequest(payload)
+		root := gjson.ParseBytes(payload)
+		if responsesPayloadNeedsChatBridge(root) {
+			payload = sdktranslator.TranslateRequest(sdktranslator.FormatOpenAI, sdktranslator.FormatOpenAIResponse, model, payload, stream)
+			// Preserve Responses-level instructions when a client combines them
+			// with a Chat-shaped messages array.
+			if instructions := root.Get("instructions"); instructions.Type == gjson.String && strings.TrimSpace(instructions.String()) != "" {
+				mergedInstructions := instructions.String()
+				translatedInstructions := gjson.GetBytes(payload, "instructions")
+				if translatedInstructions.Type == gjson.String && strings.TrimSpace(translatedInstructions.String()) != "" && !strings.EqualFold(strings.TrimSpace(translatedInstructions.String()), strings.TrimSpace(mergedInstructions)) {
+					mergedInstructions += "\n\n" + translatedInstructions.String()
+				}
+				if updated, errSet := sjson.SetBytes(payload, "instructions", mergedInstructions); errSet == nil {
+					payload = updated
+				}
+			}
+		}
+	}
+	return openairesponses.NormalizeOpenAIResponsesRequest(payload)
+}
+
+func responsesPayloadNeedsChatBridge(root gjson.Result) bool {
+	messages := root.Get("messages")
+	if !messages.IsArray() || len(messages.Array()) == 0 {
+		return false
+	}
+	input := root.Get("input")
+	if !input.Exists() || input.Type == gjson.Null {
+		return true
+	}
+	if input.Type == gjson.String {
+		return strings.TrimSpace(input.String()) == ""
+	}
+	if input.IsArray() {
+		probe := []byte(`{}`)
+		probe, _ = sjson.SetRawBytes(probe, "input", []byte(input.Raw))
+		return !openairesponses.HasUsableOpenAIResponsesInput(probe)
+	}
+	if input.IsObject() {
+		probe := []byte(`{}`)
+		probe, _ = sjson.SetRawBytes(probe, "input", []byte(input.Raw))
+		return !openairesponses.HasUsableOpenAIResponsesInput(probe)
+	}
+	return false
 }
 
 func openAICompatStreamDataError(payload []byte, eventName string) (statusErr, bool) {
